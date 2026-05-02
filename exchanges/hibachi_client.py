@@ -120,6 +120,17 @@ class HibachiClient:
             positions.append(self._to_dict(p) if not isinstance(p, dict) else p)
         return positions
 
+    async def get_position_signed_size(self, symbol: str) -> float:
+        """심볼 포지션 사이즈 (LONG +, SHORT -). 없으면 0."""
+        positions = await self.get_positions()
+        for p in positions:
+            if p.get("symbol") != symbol:
+                continue
+            qty = abs(float(p.get("quantity", p.get("size", 0)) or 0))
+            side = (p.get("side") or p.get("direction") or "").upper()
+            return qty if side in ("BUY", "LONG") else -qty
+        return 0.0
+
     async def get_mark_price(self, symbol: str) -> float:
         result = await _retry(self._get_prices_raw, symbol)
         # SDK PriceResponse: markPrice 속성

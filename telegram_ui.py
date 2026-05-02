@@ -15,6 +15,7 @@ BTN_STATUS = "📊 Status"
 BTN_FUNDING = "💰 Funding"
 BTN_HISTORY = "📋 History"
 BTN_POSITIONS = "📌 Positions"
+BTN_RESYNC = "🔄 Resync"
 BTN_CLOSE = "🔚 Close Now"
 BTN_STOP = "⏹ Stop"
 
@@ -22,7 +23,8 @@ KEYBOARD = {
     "keyboard": [
         [BTN_STATUS, BTN_FUNDING],
         [BTN_HISTORY, BTN_POSITIONS],
-        [BTN_CLOSE, BTN_STOP],
+        [BTN_RESYNC, BTN_CLOSE],
+        [BTN_STOP],
     ],
     "resize_keyboard": True,
     "is_persistent": True,

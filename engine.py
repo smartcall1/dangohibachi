@@ -71,12 +71,13 @@ class Engine:
     def _register_telegram_callbacks(self):
         from telegram_ui import (
             BTN_STATUS, BTN_FUNDING, BTN_HISTORY,
-            BTN_POSITIONS, BTN_CLOSE, BTN_STOP,
+            BTN_POSITIONS, BTN_RESYNC, BTN_CLOSE, BTN_STOP,
         )
         self._tg.register_callback(BTN_STATUS, self._on_status)
         self._tg.register_callback(BTN_FUNDING, self._on_funding)
         self._tg.register_callback(BTN_HISTORY, self._on_history)
         self._tg.register_callback(BTN_POSITIONS, self._on_positions)
+        self._tg.register_callback(BTN_RESYNC, self._on_resync)
         self._tg.register_callback(BTN_CLOSE, self._on_close_now)
         self._tg.register_callback(BTN_STOP, self._on_stop)
 
@@ -178,6 +179,31 @@ class Engine:
         except Exception as e:
             text += f"<b>Hibachi</b> 조회 실패: {e}\n"
         await self._tg.send_alert(text)
+
+    async def _on_resync(self):
+        """수동 정리 후 강제 동기화 — 양쪽 실측이 dust 미만이면 즉시 사이클 종료."""
+        pos = self.bot_state.position
+        if not pos:
+            await self._tg.send_alert("🔄 Resync: 활성 포지션 없음")
+            return
+        try:
+            d_size = await self._dango.get_position_signed_size(Config.DANGO_SYMBOL_MAP[pos.pair])
+            h_size = await self._hb.get_position_signed_size(Config.HIBACHI_SYMBOL_MAP[pos.pair])
+        except Exception as e:
+            await self._tg.send_alert(f"🔄 Resync 실패: {e}")
+            return
+
+        if await self._positions_at_dust(pos):
+            await self._tg.send_alert(
+                f"🔄 Resync: 양쪽 dust 이하 (dango={d_size:.6f} hibachi={h_size:.6f})"
+                f" — 사이클 정상 종료"
+            )
+            await self._finalize_cycle(pos, reason_override="manual_resync")
+        else:
+            await self._tg.send_alert(
+                f"🔄 Resync: 잔여 보유 — dango={d_size:.6f} hibachi={h_size:.6f}\n"
+                f"수동 정리 후 다시 누르거나 🔚 Close Now 사용하시오"
+            )
 
     async def _on_close_now(self):
         """현재 사이클 즉시 EXIT (HOLD 상태에서만)"""
@@ -329,6 +355,12 @@ class Engine:
         pos = self.bot_state.position
         await asyncio.sleep(30)
 
+        # 외부 정리/수동 청산 인식 — 양쪽 실측 합이 dust 미만이면 사이클 정리
+        if await self._positions_at_dust(pos):
+            logger.info("HOLD 중 양쪽 dust 이하 감지 — 외부 정리로 간주, 사이클 종료")
+            await self._finalize_cycle(pos, reason_override="external_clear")
+            return
+
         try:
             bal = await self._dango.get_balance()
             current_balance = bal["equity"]
@@ -378,16 +410,20 @@ class Engine:
         logger.info("EXIT 시작: %s %s reason=%s", pos.pair, pos.direction.value, pos.exit_reason)
 
         total_to_exit = pos.dango_size
-        per_chunk = total_to_exit / Config.EXIT_CHUNKS
+        per_chunk = total_to_exit / Config.EXIT_CHUNKS if total_to_exit > 0 else 0
         exited = 0.0
 
         for chunk_idx in range(1, Config.EXIT_CHUNKS + 1):
+            # 매 청크마다 dust 체크 — 외부 정리/누적 청산 완료 인식
+            if await self._positions_at_dust(pos):
+                logger.info("EXIT 중 dust 도달 — 청크 %d에서 조기 종료", chunk_idx)
+                break
+
             remaining = total_to_exit - exited
             if remaining < 1e-8:
                 break
 
             chunk_size = min(per_chunk, remaining)
-            # 청산은 진입 반대 방향
             exit_side = "SELL" if pos.dango_side == "BUY" else "BUY"
             success = await self._xemm_chunk_exit(
                 pos=pos,
@@ -404,12 +440,27 @@ class Engine:
                     self._transition(State.MANUAL_INTERVENTION)
                     return
 
-        # 청산 완료
+        # 청산 후 실측 확정 — 잔여가 dust 초과면 MANUAL
+        if not await self._positions_at_dust(pos):
+            d_remain = await self._dango.get_position_signed_size(Config.DANGO_SYMBOL_MAP[pos.pair])
+            h_remain = await self._hb.get_position_signed_size(Config.HIBACHI_SYMBOL_MAP[pos.pair])
+            logger.warning(
+                "EXIT 5청크 완료 후 잔여 dust 초과 — dango=%.6f hibachi=%.6f → MANUAL",
+                d_remain, h_remain,
+            )
+            self._transition(State.MANUAL_INTERVENTION)
+            return
+
+        await self._finalize_cycle(pos)
+
+    async def _finalize_cycle(self, pos: Position, reason_override: Optional[str] = None):
+        """사이클 정상 종료 — Cycle 기록 + 텔레그램 알림 + COOLDOWN 전환."""
         self.bot_state.exit_failure_count = 0
         bal = await self._safe_get_balance()
-        pnl = bal - pos.entry_balance if bal else 0.0
+        pnl = (bal - pos.entry_balance) if bal else 0.0
         self.bot_state.cycle_count += 1
 
+        reason = reason_override or pos.exit_reason or "unknown"
         cycle = Cycle(
             cycle_id=self.bot_state.cycle_count,
             pair=pos.pair,
@@ -417,15 +468,33 @@ class Engine:
             entry_balance=pos.entry_balance,
             exit_balance=bal or pos.entry_balance,
             pnl=pnl,
-            exit_reason=pos.exit_reason,
+            exit_reason=reason,
             exit_time=time.time(),
             chunks=pos.chunks_filled,
         )
         self._save_cycle(cycle)
-        await self._tg.notify_exit(pos.exit_reason, pnl, self.bot_state.cycle_count)
+        await self._tg.notify_exit(reason, pnl, self.bot_state.cycle_count)
 
         self.bot_state.position = None
         self._transition(State.COOLDOWN)
+
+    async def _positions_at_dust(self, pos: Position) -> bool:
+        """양 거래소 실측 포지션의 합 notional이 DUST_NOTIONAL_USD 미만이면 True.
+        외부 정리/수동 청산 인식용."""
+        try:
+            d_size = await self._dango.get_position_signed_size(Config.DANGO_SYMBOL_MAP[pos.pair])
+            h_size = await self._hb.get_position_signed_size(Config.HIBACHI_SYMBOL_MAP[pos.pair])
+        except Exception as e:
+            logger.debug("dust 체크 조회 실패: %s", e)
+            return False
+        # notional 추정 (mark 기준)
+        try:
+            mark = await self._dango.get_mark_price(Config.DANGO_SYMBOL_MAP[pos.pair])
+        except Exception:
+            mark = pos.avg_entry_price
+        d_notional = abs(d_size) * mark
+        h_notional = abs(h_size) * mark
+        return d_notional < Config.DUST_NOTIONAL_USD and h_notional < Config.DUST_NOTIONAL_USD
 
     # ──────────────────────────────────────────────
     # COOLDOWN
@@ -457,34 +526,39 @@ class Engine:
         self, pos: Position, chunk_idx: int, total_chunks: int, reduce_only: bool
     ) -> bool:
         """
-        1청크 진입: Dango maker → 체결 시 Hibachi taker.
-        성공이면 True, 실패이면 False.
+        1청크 진입: Dango maker → 실측 체결량으로 Hibachi taker 헷지.
+
+        안전 패턴 (Bug C 방지, P0+P1 적용):
+        1. 매 시도마다 포지션 사이즈 before/after 비교 → 실제 체결량 산정
+        2. 항상 cancel 후 잔량 정리 (race 방지)
+        3. Hibachi 헷지 부족 시 Dango 반대 방향으로 롤백
+        4. MAKER_RETRY_LIMIT 초과 시 종료 (무한 루프 방지)
         """
         dango_sym = Config.DANGO_SYMBOL_MAP[pos.pair]
         hibachi_sym = Config.HIBACHI_SYMBOL_MAP[pos.pair]
         chunk_size = calc_chunk_size(pos.target_notional, pos.avg_entry_price, total_chunks)
+        tick = Config.PAIR_TICK_SIZE.get(pos.pair, 0.01)
+        d_sign = 1.0 if pos.dango_side == "BUY" else -1.0
+        h_sign = 1.0 if pos.hibachi_side == "BUY" else -1.0
 
         concession = 0.0
         anchor_price = None
 
-        while True:
+        for retry in range(Config.MAKER_RETRY_LIMIT):
             if self._health_monitor.is_down:
                 logger.warning("Dango 다운 — 청크 %d 중단", chunk_idx)
                 return False
 
-            # BBO 재조회 (앵커 설정 또는 재앵커링)
             try:
                 bbo = await self._dango.get_bbo(dango_sym)
-                spread = bbo["ask"] - bbo["bid"]
-                if anchor_price is None:
-                    anchor_price = bbo["ask"] if pos.dango_side == "BUY" else bbo["bid"]
             except Exception as e:
                 logger.warning("BBO 조회 실패: %s", e)
                 await asyncio.sleep(2)
                 continue
+            spread = bbo["ask"] - bbo["bid"]
+            if anchor_price is None:
+                anchor_price = bbo["ask"] if pos.dango_side == "BUY" else bbo["bid"]
 
-            # 진입 가격 계산 (concession으로 점진적 개선)
-            tick = Config.PAIR_TICK_SIZE.get(pos.pair, 0.01)
             if pos.dango_side == "BUY":
                 price = round((anchor_price - concession) / tick) * tick
             else:
@@ -492,7 +566,11 @@ class Engine:
 
             cid = self._dango.make_client_order_id()
 
-            # Dango maker 주문 등록
+            try:
+                size_before = await self._dango.get_position_signed_size(dango_sym)
+            except Exception:
+                size_before = 0.0
+
             try:
                 await self._dango.place_limit_order(
                     dango_sym, pos.dango_side, price, chunk_size,
@@ -503,45 +581,84 @@ class Engine:
                 await asyncio.sleep(2)
                 continue
 
-            # 체결 대기
-            fill = await self._dango.wait_for_fill(cid, timeout=Config.MAKER_FILL_TIMEOUT_SECONDS)
+            fill_event = await self._dango.wait_for_fill(cid, timeout=Config.MAKER_FILL_TIMEOUT_SECONDS)
 
-            if fill:
-                filled_size = float(fill.get("fill_size", chunk_size))
-                fill_price = float(fill.get("fill_price", price))
+            # 항상 cancel — 잔여 maker 정리 (이미 풀체결이면 무시됨)
+            try:
+                await self._dango.cancel_order_by_client_id(dango_sym, cid)
+            except Exception:
+                pass
+            await asyncio.sleep(2)  # cancel 전파 + 후속 부분 체결 캡처
 
-                # Hibachi taker 즉시 실행
-                try:
-                    hb_result = await self._hb.place_limit_order(
-                        hibachi_sym, pos.hibachi_side,
-                        fill_price, filled_size, post_only=False,
-                    )
-                    hb_price = fill_price
-                except Exception as e:
-                    logger.error("Hibachi taker 실패 (청크 %d): %s", chunk_idx, e)
-                    # Dango 포지션만 잡힌 상태 → 취소 시도
-                    await self._dango.place_market_order(dango_sym, pos.dango_side, filled_size)
-                    return False
+            try:
+                size_after = await self._dango.get_position_signed_size(dango_sym)
+            except Exception as e:
+                logger.warning("Dango 포지션 조회 실패: %s", e)
+                size_after = size_before  # 보수적: 미체결로 간주
 
-                # 포지션 업데이트
-                pos.dango_size += filled_size
-                pos.hibachi_size += filled_size
-                pos.chunks_filled += 1
-                pos.avg_entry_price = (
-                    (pos.avg_entry_price * (chunk_idx - 1) + fill_price) / chunk_idx
+            actual_filled = max(0.0, (size_after - size_before) * d_sign)
+
+            if actual_filled < chunk_size * 0.01:
+                # 사실상 미체결 — 가격 양보 후 재시도
+                concession += max(Config.MAKER_PRICE_STEP_USD, tick)
+                if spread > 0 and concession > spread * 0.5:
+                    anchor_price = None
+                    concession = 0.0
+                continue
+
+            fill_price = float(fill_event.get("fill_price", price)) if fill_event else price
+
+            # Hibachi taker (실측 체결량으로 헷지)
+            try:
+                hb_size_before = await self._hb.get_position_signed_size(hibachi_sym)
+                slip = 1.005 if pos.hibachi_side == "BUY" else 0.995
+                hb_taker_price = round(fill_price * slip, 2)
+                await self._hb.place_limit_order(
+                    hibachi_sym, pos.hibachi_side, hb_taker_price,
+                    actual_filled, post_only=False,
                 )
-                logger.info("청크 %d/%d 완료: %.6f @ %.2f", chunk_idx, total_chunks, filled_size, fill_price)
-                return True
+                await asyncio.sleep(1)
+                hb_size_after = await self._hb.get_position_signed_size(hibachi_sym)
+                hb_filled = max(0.0, (hb_size_after - hb_size_before) * h_sign)
+                if hb_filled < actual_filled * 0.9:
+                    raise RuntimeError(
+                        f"Hibachi 헷지 부족: {hb_filled:.6f}/{actual_filled:.6f}"
+                    )
+            except Exception as e:
+                logger.error("Hibachi 헷지 실패 — Dango 롤백 (반대 방향 시장가): %s", e)
+                rollback_side = "SELL" if pos.dango_side == "BUY" else "BUY"
+                try:
+                    await self._dango.place_market_order(
+                        dango_sym, rollback_side, actual_filled,
+                        slippage=Config.EMERGENCY_CLOSE_SLIPPAGE_PCT,
+                    )
+                except Exception as re:
+                    logger.critical(
+                        "Dango 롤백 실패! 수동 개입 필요 (size=%.6f side=%s): %s",
+                        actual_filled, rollback_side, re,
+                    )
+                return False
 
-            # 미체결 → 취소 후 재시도
-            await self._dango.cancel_order_by_client_id(dango_sym, cid)
-            concession += max(Config.MAKER_PRICE_STEP_USD, tick)
+            # 성공 — 체결량 동기화 (일치 보장된 값 사용)
+            matched = min(actual_filled, hb_filled)
+            pos.dango_size += matched
+            pos.hibachi_size += matched
+            pos.chunks_filled += 1
+            pos.avg_entry_price = (
+                (pos.avg_entry_price * (chunk_idx - 1) + fill_price) / chunk_idx
+            )
+            logger.info(
+                "청크 %d/%d 완료: matched=%.6f (dango=%.6f hibachi=%.6f) @ %.2f retries=%d",
+                chunk_idx, total_chunks, matched, actual_filled, hb_filled,
+                fill_price, retry,
+            )
+            return True
 
-            # BBO 재앵커링 조건
-            if spread > 0 and concession > spread * 0.5:
-                logger.debug("BBO 재앵커링 (concession=%.4f > spread/2=%.4f)", concession, spread / 2)
-                anchor_price = None
-                concession = 0.0
+        logger.warning(
+            "청크 %d MAKER_RETRY_LIMIT(%d) 소진 — 미체결",
+            chunk_idx, Config.MAKER_RETRY_LIMIT,
+        )
+        return False
 
     # ──────────────────────────────────────────────
     # XEMM 청크 실행 (청산)
@@ -551,35 +668,44 @@ class Engine:
         self, pos: Position, chunk_idx: int, total_chunks: int,
         chunk_size: float, exit_side: str,
     ) -> bool:
+        """1청크 청산: Dango maker EXIT → 실측 체결량으로 Hibachi 반대 청산."""
         dango_sym = Config.DANGO_SYMBOL_MAP[pos.pair]
         hibachi_sym = Config.HIBACHI_SYMBOL_MAP[pos.pair]
         hibachi_close_side = "BUY" if pos.hibachi_side == "SELL" else "SELL"
+        tick = Config.PAIR_TICK_SIZE.get(pos.pair, 0.01)
+        # exit_side는 반대 — SELL이면 Dango LONG 청산이므로 size 감소량은 음수, 부호 보정
+        d_exit_sign = -1.0 if exit_side == "SELL" else 1.0   # Dango 사이즈 변화 부호 (감소가 정상)
+        h_close_sign = 1.0 if hibachi_close_side == "BUY" else -1.0
 
         concession = 0.0
         anchor_price = None
 
-        while True:
+        for retry in range(Config.MAKER_RETRY_LIMIT):
             if self._health_monitor.is_down:
                 logger.warning("Dango 다운 — EXIT 청크 %d 중단", chunk_idx)
                 return False
 
             try:
                 bbo = await self._dango.get_bbo(dango_sym)
-                spread = bbo["ask"] - bbo["bid"]
-                if anchor_price is None:
-                    anchor_price = bbo["bid"] if exit_side == "SELL" else bbo["ask"]
             except Exception as e:
                 logger.warning("EXIT BBO 조회 실패: %s", e)
                 await asyncio.sleep(2)
                 continue
+            spread = bbo["ask"] - bbo["bid"]
+            if anchor_price is None:
+                anchor_price = bbo["bid"] if exit_side == "SELL" else bbo["ask"]
 
-            tick = Config.PAIR_TICK_SIZE.get(pos.pair, 0.01)
             if exit_side == "SELL":
                 price = round((anchor_price + concession) / tick) * tick
             else:
                 price = round((anchor_price - concession) / tick) * tick
 
             cid = self._dango.make_client_order_id()
+
+            try:
+                size_before = await self._dango.get_position_signed_size(dango_sym)
+            except Exception:
+                size_before = 0.0
 
             try:
                 await self._dango.place_limit_order(
@@ -591,32 +717,69 @@ class Engine:
                 await asyncio.sleep(2)
                 continue
 
-            fill = await self._dango.wait_for_fill(cid, timeout=Config.MAKER_FILL_TIMEOUT_SECONDS)
+            fill_event = await self._dango.wait_for_fill(cid, timeout=Config.MAKER_FILL_TIMEOUT_SECONDS)
 
-            if fill:
-                filled_size = float(fill.get("fill_size", chunk_size))
-                fill_price = float(fill.get("fill_price", price))
+            try:
+                await self._dango.cancel_order_by_client_id(dango_sym, cid)
+            except Exception:
+                pass
+            await asyncio.sleep(2)
 
-                try:
-                    await self._hb.place_limit_order(
-                        hibachi_sym, hibachi_close_side,
-                        fill_price, filled_size, post_only=False,
+            try:
+                size_after = await self._dango.get_position_signed_size(dango_sym)
+            except Exception as e:
+                logger.warning("EXIT 포지션 조회 실패: %s", e)
+                size_after = size_before
+
+            # 청산은 사이즈 감소 — d_exit_sign으로 부호 보정해 양수 체결량 추출
+            actual_filled = max(0.0, (size_before - size_after) * (-d_exit_sign))
+
+            if actual_filled < chunk_size * 0.01:
+                concession += max(Config.MAKER_PRICE_STEP_USD, tick)
+                if spread > 0 and concession > spread * 0.5:
+                    anchor_price = None
+                    concession = 0.0
+                continue
+
+            fill_price = float(fill_event.get("fill_price", price)) if fill_event else price
+
+            # Hibachi 반대 청산 (실측 체결량으로)
+            try:
+                hb_size_before = await self._hb.get_position_signed_size(hibachi_sym)
+                slip = 1.005 if hibachi_close_side == "BUY" else 0.995
+                hb_taker_price = round(fill_price * slip, 2)
+                await self._hb.place_limit_order(
+                    hibachi_sym, hibachi_close_side, hb_taker_price,
+                    actual_filled, post_only=False,
+                )
+                await asyncio.sleep(1)
+                hb_size_after = await self._hb.get_position_signed_size(hibachi_sym)
+                hb_closed = max(0.0, (hb_size_after - hb_size_before) * h_close_sign)
+                if hb_closed < actual_filled * 0.9:
+                    raise RuntimeError(
+                        f"Hibachi EXIT 부족: {hb_closed:.6f}/{actual_filled:.6f}"
                     )
-                except Exception as e:
-                    logger.error("EXIT Hibachi taker 실패 (청크 %d): %s", chunk_idx, e)
-                    return False
+            except Exception as e:
+                logger.error(
+                    "EXIT Hibachi 실패 — 청크 %d (Dango %.6f 청산됨, Hibachi 미청산): %s",
+                    chunk_idx, actual_filled, e,
+                )
+                # EXIT 시 롤백 안 함 — 다시 진입은 위험. 다음 청크/재시도에 의존.
+                return False
 
-                pos.dango_size -= filled_size
-                pos.hibachi_size -= filled_size
-                logger.info("EXIT 청크 %d/%d: %.6f @ %.2f", chunk_idx, total_chunks, filled_size, fill_price)
-                return True
+            pos.dango_size = max(0.0, pos.dango_size - actual_filled)
+            pos.hibachi_size = max(0.0, pos.hibachi_size - hb_closed)
+            logger.info(
+                "EXIT 청크 %d/%d: dango=%.6f hibachi=%.6f @ %.2f retries=%d",
+                chunk_idx, total_chunks, actual_filled, hb_closed, fill_price, retry,
+            )
+            return True
 
-            await self._dango.cancel_order_by_client_id(dango_sym, cid)
-            concession += max(Config.MAKER_PRICE_STEP_USD, tick)
-
-            if spread > 0 and concession > spread * 0.5:
-                anchor_price = None
-                concession = 0.0
+        logger.warning(
+            "EXIT 청크 %d MAKER_RETRY_LIMIT(%d) 소진",
+            chunk_idx, Config.MAKER_RETRY_LIMIT,
+        )
+        return False
 
     # ──────────────────────────────────────────────
     # 긴급 Hibachi-only 청산

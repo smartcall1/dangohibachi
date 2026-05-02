@@ -507,7 +507,8 @@ class DangoClient:
     # ──────────────────────────────────────────────
 
     async def get_bbo(self, pair_id: str) -> dict:
-        """BBO (best bid/ask) 조회. {"bid": float, "ask": float, "mark": float}"""
+        """BBO (best bid/ask) 조회. {"bid": float, "ask": float, "mark": float}.
+        빈 오더북·역전·센티넬 가격 시 RuntimeError (nado_grvt ARB 사고 방지)."""
         result = await self._query_app({
             "liquidity_depth": {
                 "pair_id": pair_id,
@@ -523,13 +524,32 @@ class DangoClient:
         best_bid = max((float(p) for p in bids), default=0.0)
         best_ask = min((float(p) for p in asks), default=0.0)
 
+        # 가드 — 빈 오더북, 역전, 비정상 가격
+        if best_bid <= 0 or best_ask <= 0:
+            raise RuntimeError(f"빈 오더북 또는 0가격: bid={best_bid} ask={best_ask}")
+        if best_ask < best_bid:
+            raise RuntimeError(f"BBO 역전: bid={best_bid} > ask={best_ask}")
+        if best_ask > best_bid * 2:
+            raise RuntimeError(f"BBO 비정상 (스프레드 100% 이상): bid={best_bid} ask={best_ask}")
+
         try:
             stats = await self._query_pair_stats(pair_id)
             mark = float(stats.get("currentPrice", 0) or 0)
         except Exception:
-            mark = (best_bid + best_ask) / 2 if best_bid and best_ask else 0.0
+            mark = (best_bid + best_ask) / 2
 
         return {"bid": best_bid, "ask": best_ask, "mark": mark}
+
+    async def get_position_signed_size(self, pair_id: str) -> float:
+        """페어 포지션 사이즈 (LONG +, SHORT -). 없으면 0."""
+        result = await self._query_user_state()
+        if not result:
+            return 0.0
+        positions = result.get("positions", {})
+        pos = positions.get(pair_id)
+        if not pos:
+            return 0.0
+        return float(pos.get("size", 0) or 0)
 
     async def get_mark_price(self, pair_id: str) -> float:
         bbo = await self.get_bbo(pair_id)

@@ -36,10 +36,20 @@ class MarginMonitor:
             await asyncio.sleep(10)
 
     async def _check(self):
-        balance = await self._hb.get_balance()
-        equity = float(balance.get("equity", balance.get("totalEquityValue", 0)) or 0)
-        positions = await self._hb.get_positions()
+        # API 실패와 '진짜 무포지션'을 분리 — 거짓 안전 신호 방지 (delta_donemoji cycle 11/12 패턴)
+        try:
+            balance = await self._hb.get_balance()
+            positions = await self._hb.get_positions()
+        except Exception as e:
+            logger.warning("Margin check API 실패 (이전 margin_pct=%.1f%% 유지): %s",
+                           self._margin_pct, e)
+            return
 
+        if positions is None:
+            logger.warning("Hibachi positions=None — margin check 스킵")
+            return
+
+        equity = float(balance.get("equity", balance.get("totalEquityValue", 0)) or 0)
         if not positions or equity <= 0:
             self._margin_pct = 100.0
             return
