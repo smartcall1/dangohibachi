@@ -452,12 +452,12 @@ class DangoClient:
         """
         while self._running:
             try:
-                async with websockets.connect(
-                    self._ws_url,
-                    subprotocols=[_GQL_WS_SUBPROTOCOL],
-                    ping_interval=30,
-                    ping_timeout=10,
-                ) as ws:
+                    async with websockets.connect(
+                        self._ws_url,
+                        subprotocols=[_GQL_WS_SUBPROTOCOL],
+                        ping_interval=20,
+                        ping_timeout=20,
+                    ) as ws:
                     # 연결 초기화
                     await ws.send(json.dumps({"type": _GQL_CONNECTION_INIT, "payload": {}}))
                     ack = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
