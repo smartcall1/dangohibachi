@@ -6,6 +6,7 @@ import base64
 import hashlib
 import json
 import logging
+import os
 import time
 import uuid
 from typing import Any, Callable, Optional
@@ -114,6 +115,10 @@ class DangoClient:
         self._nonce = int(time.time())
         self._nonce_lock = asyncio.Lock()
 
+        # Dango 계정 인덱스 (첫 주문 시 자동 탐색)
+        self._user_index: int = int(os.environ.get("DANGO_USER_INDEX", "0"))
+        self._user_index_found: bool = False
+
         # WebSocket 이벤트 콜백: client_order_id → asyncio.Event + fill data
         self._fill_events: dict[str, asyncio.Event] = {}
         self._fill_data: dict[str, dict] = {}
@@ -135,7 +140,7 @@ class DangoClient:
     # 서명 & 트랜잭션 구성
     # ──────────────────────────────────────────────
 
-    def _build_tx(self, msg: dict, nonce: int, gas_limit: int = 2_000_000) -> dict:
+    def _build_tx(self, msg: dict, nonce: int, user_index: int, gas_limit: int = 2_000_000) -> dict:
         sign_doc = {
             "chain_id": self._chain_id,
             "expiry": None,
@@ -155,7 +160,7 @@ class DangoClient:
                 "chain_id": self._chain_id,
                 "expiry": None,
                 "nonce": nonce,
-                "user_index": 0,
+                "user_index": user_index,
             },
             "credential": {
                 "standard": {
@@ -165,10 +170,18 @@ class DangoClient:
             },
         }
 
-    async def _broadcast(self, msg: dict) -> dict:
-        """트랜잭션을 broadcastTxSync로 전송"""
+    def _parse_broadcast_error(self, result: dict) -> Optional[str]:
+        """broadcastTxSync 응답에서 에러 메시지 추출. 성공이면 None 반환."""
+        check_tx = result.get("check_tx", {})
+        tx_result = check_tx.get("result", {})
+        if "Err" in tx_result:
+            return tx_result["Err"].get("error", "unknown error")
+        return None
+
+    async def _broadcast_once(self, msg: dict, user_index: int) -> dict:
+        """단일 broadcastTxSync 전송 (user_index 지정)"""
         nonce = await self._next_nonce()
-        tx = self._build_tx(msg, nonce)
+        tx = self._build_tx(msg, nonce, user_index)
         query = """
         mutation BroadcastTx($tx: Tx!) {
           broadcastTxSync(tx: $tx)
@@ -185,14 +198,38 @@ class DangoClient:
             err_msg = f"Dango broadcast error: {data['errors']}"
             logger.error(err_msg)
             raise RuntimeError(err_msg)
-        
-        result = data.get("data", {}).get("broadcastTxSync", {})
-        logger.info("Dango broadcast result: %s", json.dumps(result))
-        
-        if result and result.get("code") != 0:
-            logger.warning("Dango tx rejected: %s", json.dumps(result))
-        
-        return result
+
+        return data.get("data", {}).get("broadcastTxSync", {})
+
+    async def _broadcast(self, msg: dict) -> dict:
+        """트랜잭션 전송. user_index 불일치 시 자동 탐색 (최초 1회)."""
+        max_scan = 5  # 인덱스 0~4까지 시도
+
+        for attempt in range(max_scan if not self._user_index_found else 1):
+            idx = self._user_index + (attempt if not self._user_index_found else 0)
+            result = await self._broadcast_once(msg, idx)
+            err = self._parse_broadcast_error(result)
+
+            if err is None:
+                # 성공
+                if not self._user_index_found:
+                    self._user_index = idx
+                    self._user_index_found = True
+                    logger.info("Dango user_index 확정: %d", idx)
+                return result
+
+            if "isn't associated with user" in err and not self._user_index_found:
+                logger.warning("Dango user_index %d 불일치, 다음 시도...", idx)
+                continue
+
+            # 그 외 에러는 그냥 로그 남기고 반환
+            logger.warning("Dango tx rejected (index=%d): %s", idx, err)
+            return result
+
+        raise RuntimeError(
+            f"Dango user_index를 찾을 수 없습니다 (0~{max_scan-1} 모두 실패). "
+            f".env에 DANGO_USER_INDEX=<올바른값> 을 설정하세요."
+        )
 
     # ──────────────────────────────────────────────
     # REST 조회 헬퍼
