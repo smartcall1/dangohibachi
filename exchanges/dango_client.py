@@ -110,8 +110,8 @@ class DangoClient:
         self._ws_url = ws_url
         self._key_hash = _derive_key_hash(private_key)
 
-        # 논스: timestamp 기반 (ms), 각 tx마다 증분
-        self._nonce = int(time.time() * 1000)
+        # 논스: timestamp 기반 (s), 각 tx마다 증분 (Dango 서버 u32 제약 대응)
+        self._nonce = int(time.time())
         self._nonce_lock = asyncio.Lock()
 
         # WebSocket 이벤트 콜백: client_order_id → asyncio.Event + fill data
