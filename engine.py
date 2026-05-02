@@ -46,11 +46,13 @@ class Engine:
         await self._dango.start()
         asyncio.create_task(self._margin_monitor.run())
         asyncio.create_task(self._health_monitor.run())
+        self._register_telegram_callbacks()
         logger.info("엔진 시작")
 
         while not self._stop_requested:
             try:
                 await self._tick()
+                await self._tg.poll_updates()
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -60,6 +62,140 @@ class Engine:
         await self._shutdown()
 
     async def request_stop(self):
+        self._stop_requested = True
+
+    # ──────────────────────────────────────────────
+    # 텔레그램 버튼 핸들러
+    # ──────────────────────────────────────────────
+
+    def _register_telegram_callbacks(self):
+        from telegram_ui import (
+            BTN_STATUS, BTN_FUNDING, BTN_HISTORY,
+            BTN_POSITIONS, BTN_CLOSE, BTN_STOP,
+        )
+        self._tg.register_callback(BTN_STATUS, self._on_status)
+        self._tg.register_callback(BTN_FUNDING, self._on_funding)
+        self._tg.register_callback(BTN_HISTORY, self._on_history)
+        self._tg.register_callback(BTN_POSITIONS, self._on_positions)
+        self._tg.register_callback(BTN_CLOSE, self._on_close_now)
+        self._tg.register_callback(BTN_STOP, self._on_stop)
+
+    async def _on_status(self):
+        s = self.bot_state
+        pos = s.position
+        lines = [
+            f"<b>상태:</b> {s.state.value}",
+            f"<b>사이클:</b> #{s.cycle_count}",
+        ]
+        try:
+            bal = await self._dango.get_balance()
+            lines.append(f"<b>Dango equity:</b> ${bal['equity']:,.2f}")
+            lines.append(f"<b>Available:</b> ${bal['available_margin']:,.2f}")
+        except Exception as e:
+            lines.append(f"<b>Dango 잔고:</b> 조회 실패 ({e})")
+
+        if pos:
+            lines += [
+                "",
+                f"<b>페어:</b> {pos.pair} {pos.direction.value}",
+                f"<b>목표 Notional:</b> ${pos.target_notional:,.0f}",
+                f"<b>평균 진입가:</b> {pos.avg_entry_price:.4f}",
+                f"<b>Dango 사이즈:</b> {pos.dango_size:.6f}",
+                f"<b>Hibachi 사이즈:</b> {pos.hibachi_size:.6f}",
+                f"<b>청크:</b> {pos.chunks_filled}",
+            ]
+            if pos.exit_reason:
+                lines.append(f"<b>EXIT 사유:</b> {pos.exit_reason}")
+        else:
+            lines.append("<i>활성 포지션 없음</i>")
+
+        await self._tg.send_alert("\n".join(lines))
+
+    async def _on_funding(self):
+        text = "💰 <b>펀딩레이트 (8h)</b>\n\n"
+        for pair in Config.PAIRS:
+            try:
+                d_fr = await self._dango.get_funding_rate(Config.DANGO_SYMBOL_MAP[pair])
+                h_fr = await self._hb.get_funding_rate(Config.HIBACHI_SYMBOL_MAP[pair])
+                net_a = h_fr - d_fr  # Direction A: Dango LONG, Hibachi SHORT
+                text += (
+                    f"<b>{pair}</b>: dango={d_fr:+.5f}  hibachi={h_fr:+.5f}\n"
+                    f"  net(A)={net_a:+.5f}  net(B)={-net_a:+.5f}\n"
+                )
+            except Exception as e:
+                text += f"<b>{pair}</b>: 조회 실패 ({e})\n"
+        await self._tg.send_alert(text)
+
+    async def _on_history(self):
+        if not os.path.exists(self._cycles_path):
+            await self._tg.send_alert("📋 아직 완료된 사이클 없음")
+            return
+        try:
+            with open(self._cycles_path) as f:
+                lines = f.readlines()[-5:]
+        except Exception as e:
+            await self._tg.send_alert(f"📋 사이클 로그 읽기 실패: {e}")
+            return
+
+        text = "📋 <b>최근 사이클 (최대 5건)</b>\n\n"
+        for line in lines:
+            try:
+                c = json.loads(line)
+                emoji = "🟢" if c.get("pnl", 0) >= 0 else "🔴"
+                text += (
+                    f"#{c.get('cycle_id')} {c.get('pair')} {c.get('direction')} {emoji}\n"
+                    f"  PnL: ${c.get('pnl', 0):+.2f} | {c.get('exit_reason', '?')}\n\n"
+                )
+            except Exception:
+                continue
+        await self._tg.send_alert(text)
+
+    async def _on_positions(self):
+        """양 거래소 실시간 포지션/잔고 조회"""
+        text = "📌 <b>현재 포지션</b>\n\n"
+        # Dango
+        try:
+            bal = await self._dango.get_balance()
+            text += f"<b>Dango</b> equity=${bal['equity']:,.2f}\n"
+            pos = self.bot_state.position
+            if pos and pos.pair:
+                dango_pos = await self._dango.get_position(Config.DANGO_SYMBOL_MAP[pos.pair])
+                if dango_pos:
+                    text += f"  {pos.pair}: size={dango_pos.get('size', '?')}\n"
+                else:
+                    text += f"  {pos.pair}: 포지션 없음 (오더북 대기 중일 수 있음)\n"
+        except Exception as e:
+            text += f"<b>Dango</b> 조회 실패: {e}\n"
+        text += "\n"
+        # Hibachi
+        try:
+            hb_pos = await self._hb.get_positions()
+            if hb_pos:
+                for p in hb_pos:
+                    text += f"<b>Hibachi</b> {p.get('symbol')}: {p.get('quantity')}\n"
+            else:
+                text += "<b>Hibachi</b> 포지션 없음\n"
+        except Exception as e:
+            text += f"<b>Hibachi</b> 조회 실패: {e}\n"
+        await self._tg.send_alert(text)
+
+    async def _on_close_now(self):
+        """현재 사이클 즉시 EXIT (HOLD 상태에서만)"""
+        if self.bot_state.state != State.HOLD:
+            await self._tg.send_alert(
+                f"현재 상태({self.bot_state.state.value})에서는 강제 청산 불가. "
+                f"HOLD 상태에서만 가능하옵니다."
+            )
+            return
+        if not self.bot_state.position:
+            await self._tg.send_alert("청산할 포지션 없음")
+            return
+        self.bot_state.position.exit_reason = "manual_close_now"
+        self._transition(State.EXIT)
+        await self._tg.send_alert("🔚 강제 청산 시작 — EXIT 진입")
+
+    async def _on_stop(self):
+        await self._tg.send_alert("⏹ 봇 종료 요청 수신 — 정리 후 종료하옵니다")
         self._stop_requested = True
 
     # ──────────────────────────────────────────────
