@@ -111,8 +111,15 @@ class DangoClient:
         self._ws_url = ws_url
         self._key_hash = _derive_key_hash(private_key)
 
-        # 논스: timestamp 기반 (s), 각 tx마다 증분 (Dango 서버 u32 제약 대응)
-        self._nonce = int(time.time())
+        # 논스: 파일 기반 순차적 증분 (Dango 서버 MAX_NONCE_INCREASE 제약 대응)
+        self._nonce_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".dango_nonce")
+        self._nonce = 4  # 기본값 (에러 로그에서 마지막 값이 3이었음)
+        if os.path.exists(self._nonce_file):
+            try:
+                with open(self._nonce_file, "r") as f:
+                    self._nonce = int(f.read().strip())
+            except Exception:
+                pass
         self._nonce_lock = asyncio.Lock()
 
         # Dango 계정 인덱스 (첫 주문 시 자동 탐색)
@@ -134,6 +141,11 @@ class DangoClient:
     async def _next_nonce(self) -> int:
         async with self._nonce_lock:
             self._nonce += 1
+            try:
+                with open(self._nonce_file, "w") as f:
+                    f.write(str(self._nonce))
+            except Exception as e:
+                logger.warning("nonce 파일 저장 실패: %s", e)
             return self._nonce
 
     # ──────────────────────────────────────────────
@@ -235,15 +247,18 @@ class DangoClient:
     # REST 조회 헬퍼
     # ──────────────────────────────────────────────
 
-    async def _query_app(self, msg: dict) -> Any:
+    _ACCOUNT_FACTORY = "0x18d28bafcdf9d4574f920ea004dea2d13ec16f6b"
+
+    async def _query_app(self, msg: dict, contract: Optional[str] = None) -> Any:
         # GrugQueryInput은 GraphQL object literal 방식으로만 동작함 (JSON string 변수 불가)
+        target = contract or self._contract
         msg_literal = _to_gql_literal(msg)
         query = (
             "{queryApp(request:{wasm_smart:{contract:"
-            + json.dumps(self._contract)
+            + json.dumps(target)
             + ",msg:"
             + msg_literal
-            + "}})}  "
+            + "}})}"
         )
         resp = await self._http.post(
             self._gql_url,
@@ -257,6 +272,23 @@ class DangoClient:
         # 응답 구조: data.queryApp.wasm_smart = {...실제 데이터...}
         result = data["data"]["queryApp"]
         return result["wasm_smart"] if result else None
+
+    async def _fetch_user_index(self) -> Optional[int]:
+        """ACCOUNT_FACTORY에서 이 주소의 실제 user_index 조회."""
+        logger.info("Dango user_index 조회 중 (address=%s)...", self._addr)
+        try:
+            result = await self._query_app(
+                {"user": {"address": self._addr}},
+                contract=self._ACCOUNT_FACTORY,
+            )
+            if result and "index" in result:
+                idx = int(result["index"])
+                logger.info("Dango user_index 확정: %d", idx)
+                return idx
+            logger.warning("ACCOUNT_FACTORY 응답에 index 없음: %s", result)
+        except Exception as e:
+            logger.warning("user_index 조회 실패: %s", e)
+        return None
 
     async def _query_pair_stats(self, pair_id: str) -> dict:
         query = """
@@ -550,8 +582,15 @@ class DangoClient:
                 retry_delay = min(retry_delay * 2, 60)
 
     async def start(self):
-        """WebSocket 이벤트 구독 시작"""
+        """WebSocket 이벤트 구독 시작 + user_index 자동 확정"""
         self._running = True
+        # 봇 시작 시 ACCOUNT_FACTORY에서 실제 user_index 조회
+        idx = await self._fetch_user_index()
+        if idx is not None:
+            self._user_index = idx
+            self._user_index_found = True
+        else:
+            logger.warning("user_index 자동 조회 실패 — .env DANGO_USER_INDEX=%d 로 폴백", self._user_index)
         self._ws_task = asyncio.create_task(self._ws_loop())
 
     async def stop(self):
