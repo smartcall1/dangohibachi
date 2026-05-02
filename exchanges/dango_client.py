@@ -332,7 +332,8 @@ class DangoClient:
     async def _broadcast(self, msg: dict) -> dict:
         """트랜잭션 전송. user_index 불일치 + nonce 불일치 자동 보정."""
         max_scan = 5   # user_index 스캔 범위
-        max_nonce_retries = 3
+        # Dango chain은 최근 20개 nonce를 기억. 봇 재시작 시 그 범위만큼 catch-up 필요.
+        max_nonce_retries = 25
 
         for attempt in range(max_scan if not self._user_index_found else 1):
             idx = self._user_index + (attempt if not self._user_index_found else 0)
