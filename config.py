@@ -44,6 +44,14 @@ class Config:
         "SOL": "SOL/USDT-P",
         "HYPE": "HYPE/USDT-P",
     }
+    # Dango 페어별 tick size (limit price는 이 배수만 허용 — 검증된 값)
+    # BTC: 0.1 / 다른 페어는 실제 거래 시 chain error로 확인 후 보정
+    PAIR_TICK_SIZE: dict = {
+        "BTC": 0.1,
+        "ETH": 0.01,
+        "SOL": 0.001,
+        "HYPE": 0.001,
+    }
 
     # 보유 시간
     MIN_HOLD_MINUTES: int = int(os.getenv("MIN_HOLD_MINUTES", "30"))

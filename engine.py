@@ -484,10 +484,11 @@ class Engine:
                 continue
 
             # 진입 가격 계산 (concession으로 점진적 개선)
+            tick = Config.PAIR_TICK_SIZE.get(pos.pair, 0.01)
             if pos.dango_side == "BUY":
-                price = round(anchor_price - concession, 2)
+                price = round((anchor_price - concession) / tick) * tick
             else:
-                price = round(anchor_price + concession, 2)
+                price = round((anchor_price + concession) / tick) * tick
 
             cid = self._dango.make_client_order_id()
 
@@ -534,7 +535,7 @@ class Engine:
 
             # 미체결 → 취소 후 재시도
             await self._dango.cancel_order_by_client_id(dango_sym, cid)
-            concession += Config.MAKER_PRICE_STEP_USD
+            concession += max(Config.MAKER_PRICE_STEP_USD, tick)
 
             # BBO 재앵커링 조건
             if spread > 0 and concession > spread * 0.5:
@@ -572,10 +573,11 @@ class Engine:
                 await asyncio.sleep(2)
                 continue
 
+            tick = Config.PAIR_TICK_SIZE.get(pos.pair, 0.01)
             if exit_side == "SELL":
-                price = round(anchor_price + concession, 2)
+                price = round((anchor_price + concession) / tick) * tick
             else:
-                price = round(anchor_price - concession, 2)
+                price = round((anchor_price - concession) / tick) * tick
 
             cid = self._dango.make_client_order_id()
 
@@ -610,7 +612,7 @@ class Engine:
                 return True
 
             await self._dango.cancel_order_by_client_id(dango_sym, cid)
-            concession += Config.MAKER_PRICE_STEP_USD
+            concession += max(Config.MAKER_PRICE_STEP_USD, tick)
 
             if spread > 0 and concession > spread * 0.5:
                 anchor_price = None
