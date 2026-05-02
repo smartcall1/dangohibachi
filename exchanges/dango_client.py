@@ -177,9 +177,15 @@ class DangoClient:
             return self._nonce
 
     def _extract_chain_nonce(self, err: str) -> Optional[int]:
-        """에러 메시지에서 체인 현재 논스를 파싱. 'too far ahead: X > Y + ...' → Y 반환."""
+        """에러 메시지에서 체인 nonce 파싱. 다음 _next_nonce 호출이 +1 하므로 N을 그대로 반환.
+        - 'too far ahead: X > Y + ...' → Y (체인의 max seen)
+        - 'already seen: N' → N (이미 사용된 nonce)
+        """
         import re
         m = re.search(r"nonce is too far ahead: \d+ > (\d+) \+", err)
+        if m:
+            return int(m.group(1))
+        m = re.search(r"nonce is already seen:\s*(\d+)", err)
         if m:
             return int(m.group(1))
         return None
@@ -339,10 +345,12 @@ class DangoClient:
                         logger.info("Dango user_index 확정: %d", idx)
                     return result
 
-                if "nonce is too far ahead" in err:
+                if "nonce is too far ahead" in err or "nonce is already seen" in err:
                     chain_nonce = self._extract_chain_nonce(err)
                     if chain_nonce is not None and nonce_try < max_nonce_retries - 1:
                         async with self._nonce_lock:
+                            # already seen이면 그 nonce 자체가 사용됨 → 다음 시도는 +1
+                            # too far ahead면 chain_nonce가 max seen → 다음은 +1
                             self._nonce = chain_nonce
                         logger.warning("Dango 논스 자동 보정: %d → 다음=%d", chain_nonce, chain_nonce + 1)
                         continue
@@ -565,7 +573,10 @@ class DangoClient:
                 }
             }
         }
-        await self._broadcast(msg)
+        result = await self._broadcast(msg)
+        err = self._parse_broadcast_error(result)
+        if err:
+            raise RuntimeError(f"Dango limit order failed: {err}")
         logger.info("Dango limit order placed: %s %s %s@%.4f cid=%s", pair_id, side, size, price, cid)
         return cid
 
