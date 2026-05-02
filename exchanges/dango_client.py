@@ -699,7 +699,15 @@ class DangoClient:
             }
         }
         result = await self._broadcast(msg)
-        logger.info("Dango market order: %s %s %s slippage=%.2f%%", pair_id, side, size, slippage * 100)
+        err = self._parse_broadcast_error(result)
+        if err:
+            raise RuntimeError(f"Dango market order failed (check_tx): {err}")
+        tx_hash = (result or {}).get("tx_hash", "?")
+        deliver_err = await self._verify_tx_committed(tx_hash)
+        if deliver_err:
+            raise RuntimeError(f"Dango market order failed (deliver_tx): {deliver_err}")
+        logger.info("Dango market order: %s %s %s slippage=%.2f%% tx=%s",
+                    pair_id, side, size, slippage * 100, tx_hash[:16])
         return result or {}
 
     # ──────────────────────────────────────────────

@@ -52,6 +52,13 @@ class Config:
         "SOL": 0.001,
         "HYPE": 0.001,
     }
+    # Hibachi 페어별 tick size (BTC 0.1 — 2026-05-03 mainnet 거부 로그로 확인)
+    HIBACHI_TICK_SIZE: dict = {
+        "BTC": 0.1,
+        "ETH": 0.01,
+        "SOL": 0.001,
+        "HYPE": 0.001,
+    }
 
     # 보유 시간
     MIN_HOLD_MINUTES: int = int(os.getenv("MIN_HOLD_MINUTES", "30"))

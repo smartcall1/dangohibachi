@@ -616,7 +616,8 @@ class Engine:
             try:
                 hb_size_before = await self._hb.get_position_signed_size(hibachi_sym)
                 slip = 1.005 if pos.hibachi_side == "BUY" else 0.995
-                hb_taker_price = round(fill_price * slip, 2)
+                hb_tick = Config.HIBACHI_TICK_SIZE.get(pos.pair, 0.01)
+                hb_taker_price = round(fill_price * slip / hb_tick) * hb_tick
                 await self._hb.place_limit_order(
                     hibachi_sym, pos.hibachi_side, hb_taker_price,
                     actual_filled, post_only=False,
@@ -752,7 +753,8 @@ class Engine:
             try:
                 hb_size_before = await self._hb.get_position_signed_size(hibachi_sym)
                 slip = 1.005 if hibachi_close_side == "BUY" else 0.995
-                hb_taker_price = round(fill_price * slip, 2)
+                hb_tick = Config.HIBACHI_TICK_SIZE.get(pos.pair, 0.01)
+                hb_taker_price = round(fill_price * slip / hb_tick) * hb_tick
                 await self._hb.place_limit_order(
                     hibachi_sym, hibachi_close_side, hb_taker_price,
                     actual_filled, post_only=False,
