@@ -25,7 +25,9 @@ class Config:
 
     # 거래 설정
     LEVERAGE: int = int(os.getenv("LEVERAGE", "3"))
-    PAIRS: list = ["ETH", "BTC", "SOL", "HYPE"]
+    # 활성 페어. Dango 측 유동성 부재로 현재 BTC만 사용.
+    # ETH/SOL/HYPE 유동성 회복되면 .env에 PAIRS=ETH,BTC,SOL,HYPE 로 오버라이드 가능.
+    PAIRS: list = os.getenv("PAIRS", "BTC").split(",")
     ENTRY_CHUNKS: int = 5
     EXIT_CHUNKS: int = 5
 
