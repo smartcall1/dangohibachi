@@ -542,7 +542,6 @@ class Engine:
         h_sign = 1.0 if pos.hibachi_side == "BUY" else -1.0
 
         concession = 0.0
-        anchor_price = None
 
         for retry in range(Config.MAKER_RETRY_LIMIT):
             if self._health_monitor.is_down:
@@ -556,13 +555,21 @@ class Engine:
                 await asyncio.sleep(2)
                 continue
             spread = bbo["ask"] - bbo["bid"]
-            if anchor_price is None:
-                anchor_price = bbo["ask"] if pos.dango_side == "BUY" else bbo["bid"]
-
+            # Maker 가격 로직 — POST_ONLY cross 방지 (Dango 에러 "would cross best bid" 회귀 방지)
+            # BUY maker: best_bid에서 출발, concession만큼 ask 쪽으로 이동 (ask-tick 이하로 hard cap)
+            # SELL maker: best_ask에서 출발, concession만큼 bid 쪽으로 이동 (bid+tick 이상으로 hard cap)
             if pos.dango_side == "BUY":
-                price = round((anchor_price - concession) / tick) * tick
+                raw = bbo["bid"] + concession
+                raw = min(raw, bbo["ask"] - tick)
             else:
-                price = round((anchor_price + concession) / tick) * tick
+                raw = bbo["ask"] - concession
+                raw = max(raw, bbo["bid"] + tick)
+            price = round(raw / tick) * tick
+            # 라운딩 후 cross 재검증
+            if pos.dango_side == "BUY":
+                price = min(price, bbo["ask"] - tick)
+            else:
+                price = max(price, bbo["bid"] + tick)
 
             cid = self._dango.make_client_order_id()
 
@@ -599,11 +606,8 @@ class Engine:
             actual_filled = max(0.0, (size_after - size_before) * d_sign)
 
             if actual_filled < chunk_size * 0.01:
-                # 사실상 미체결 — 가격 양보 후 재시도
+                # 사실상 미체결 — 가격 양보 후 재시도 (hard cap이 cross 방지)
                 concession += max(Config.MAKER_PRICE_STEP_USD, tick)
-                if spread > 0 and concession > spread * 0.5:
-                    anchor_price = None
-                    concession = 0.0
                 continue
 
             fill_price = float(fill_event.get("fill_price", price)) if fill_event else price
@@ -678,7 +682,6 @@ class Engine:
         h_close_sign = 1.0 if hibachi_close_side == "BUY" else -1.0
 
         concession = 0.0
-        anchor_price = None
 
         for retry in range(Config.MAKER_RETRY_LIMIT):
             if self._health_monitor.is_down:
@@ -692,13 +695,18 @@ class Engine:
                 await asyncio.sleep(2)
                 continue
             spread = bbo["ask"] - bbo["bid"]
-            if anchor_price is None:
-                anchor_price = bbo["bid"] if exit_side == "SELL" else bbo["ask"]
-
-            if exit_side == "SELL":
-                price = round((anchor_price + concession) / tick) * tick
+            # Maker 가격 (POST_ONLY cross 방지) — exit_side 기준
+            if exit_side == "BUY":
+                raw = bbo["bid"] + concession
+                raw = min(raw, bbo["ask"] - tick)
+            else:  # SELL
+                raw = bbo["ask"] - concession
+                raw = max(raw, bbo["bid"] + tick)
+            price = round(raw / tick) * tick
+            if exit_side == "BUY":
+                price = min(price, bbo["ask"] - tick)
             else:
-                price = round((anchor_price - concession) / tick) * tick
+                price = max(price, bbo["bid"] + tick)
 
             cid = self._dango.make_client_order_id()
 
@@ -736,9 +744,6 @@ class Engine:
 
             if actual_filled < chunk_size * 0.01:
                 concession += max(Config.MAKER_PRICE_STEP_USD, tick)
-                if spread > 0 and concession > spread * 0.5:
-                    anchor_price = None
-                    concession = 0.0
                 continue
 
             fill_price = float(fill_event.get("fill_price", price)) if fill_event else price
