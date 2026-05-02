@@ -455,8 +455,8 @@ class DangoClient:
                 async with websockets.connect(
                     self._ws_url,
                     subprotocols=[_GQL_WS_SUBPROTOCOL],
-                    ping_interval=20,
-                    ping_timeout=20,
+                    ping_interval=10,
+                    ping_timeout=10,
                 ) as ws:
                     # 연결 초기화
                     await ws.send(json.dumps({"type": _GQL_CONNECTION_INIT, "payload": {}}))
