@@ -182,8 +182,15 @@ class DangoClient:
         resp.raise_for_status()
         data = resp.json()
         if "errors" in data:
-            raise RuntimeError(f"Dango broadcast error: {data['errors']}")
-        return data.get("data", {}).get("broadcastTxSync", {})
+            err_msg = f"Dango broadcast error: {data['errors']}"
+            logger.error(err_msg)
+            raise RuntimeError(err_msg)
+        
+        result = data.get("data", {}).get("broadcastTxSync", {})
+        if result and result.get("code") != 0:
+            logger.warning("Dango tx rejected: code=%s, log=%s", result.get("code"), result.get("log"))
+        
+        return result
 
     # ──────────────────────────────────────────────
     # REST 조회 헬퍼
