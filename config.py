@@ -28,8 +28,9 @@ class Config:
     # 활성 페어. Dango 측 유동성 부재로 현재 BTC만 사용.
     # ETH/SOL/HYPE 유동성 회복되면 .env에 PAIRS=ETH,BTC,SOL,HYPE 로 오버라이드 가능.
     PAIRS: list = os.getenv("PAIRS", "BTC").split(",")
-    ENTRY_CHUNKS: int = 5
-    EXIT_CHUNKS: int = 5
+    # Dango 유동성이 얇아 큰 청크는 체결률 낮음 — 10개로 분할 (env 오버라이드 가능)
+    ENTRY_CHUNKS: int = int(os.getenv("ENTRY_CHUNKS", "10"))
+    EXIT_CHUNKS: int = int(os.getenv("EXIT_CHUNKS", "10"))
 
     # 심볼 매핑
     DANGO_SYMBOL_MAP: dict = {
