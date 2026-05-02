@@ -1,0 +1,570 @@
+"""상태머신 엔진 — XEMM 진입/보유/청산 루프"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import time
+from typing import Optional
+
+from config import Config
+from models import BotState, Cycle, Direction, Position, State
+from monitor import DangoHealthMonitor, MarginMonitor
+from strategy import (
+    calc_chunk_size,
+    calc_entry_notional,
+    select_pair_and_direction,
+    should_exit,
+)
+from telegram_ui import TelegramUI
+
+logger = logging.getLogger(__name__)
+
+
+class Engine:
+    def __init__(self, dango, hibachi, tg: TelegramUI):
+        self._dango = dango
+        self._hb = hibachi
+        self._tg = tg
+        self.bot_state = BotState()
+        self._stop_requested = False
+
+        # 마진 모니터 (백그라운드)
+        self._margin_monitor = MarginMonitor(hibachi, self._on_margin_emergency)
+        self._health_monitor = DangoHealthMonitor(dango, self._on_dango_down, self._on_dango_up)
+
+        self._state_path = os.path.join(Config.LOG_DIR, "bot_state.json")
+        self._cycles_path = os.path.join(Config.LOG_DIR, "cycles.jsonl")
+
+    # ──────────────────────────────────────────────
+    # 진입점
+    # ──────────────────────────────────────────────
+
+    async def run(self):
+        Config.ensure_dirs()
+        await self._dango.start()
+        asyncio.create_task(self._margin_monitor.run())
+        asyncio.create_task(self._health_monitor.run())
+        logger.info("엔진 시작")
+
+        while not self._stop_requested:
+            try:
+                await self._tick()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("엔진 루프 예외: %s", e, exc_info=True)
+                await asyncio.sleep(5)
+
+        await self._shutdown()
+
+    async def request_stop(self):
+        self._stop_requested = True
+
+    # ──────────────────────────────────────────────
+    # 상태 디스패치
+    # ──────────────────────────────────────────────
+
+    async def _tick(self):
+        s = self.bot_state.state
+        if s == State.IDLE:
+            await self._state_idle()
+        elif s == State.ANALYZE:
+            await self._state_analyze()
+        elif s == State.ENTER:
+            await self._state_enter()
+        elif s == State.HOLD:
+            await self._state_hold()
+        elif s == State.HOLD_SUSPENDED:
+            await self._state_hold_suspended()
+        elif s == State.EXIT:
+            await self._state_exit()
+        elif s == State.COOLDOWN:
+            await self._state_cooldown()
+        elif s == State.MANUAL_INTERVENTION:
+            await self._state_manual()
+
+    # ──────────────────────────────────────────────
+    # IDLE
+    # ──────────────────────────────────────────────
+
+    async def _state_idle(self):
+        logger.info("IDLE — 펀딩레이트 스캔")
+        funding = {}
+        for pair in Config.PAIRS:
+            try:
+                dango_sym = Config.DANGO_SYMBOL_MAP[pair]
+                hibachi_sym = Config.HIBACHI_SYMBOL_MAP[pair]
+                dango_fr = await self._dango.get_funding_rate(dango_sym)
+                hibachi_fr = await self._hb.get_funding_rate(hibachi_sym)
+                funding[pair] = {"dango": dango_fr, "hibachi": hibachi_fr}
+                logger.info("펀딩 %s: dango=%.5f hibachi=%.5f (8h)", pair, dango_fr, hibachi_fr)
+            except Exception as e:
+                logger.warning("펀딩 조회 실패 %s: %s", pair, e)
+
+        if not funding:
+            await asyncio.sleep(10)
+            return
+
+        pair, direction, net = select_pair_and_direction(funding)
+        logger.info("선택: %s %s net=%.5f", pair, direction.value, net)
+
+        # 잔고 확인
+        try:
+            bal = await self._dango.get_balance()
+            equity = bal["equity"]
+        except Exception as e:
+            logger.warning("Dango 잔고 조회 실패: %s", e)
+            await asyncio.sleep(5)
+            return
+
+        notional = calc_entry_notional(equity, Config.LEVERAGE)
+        dango_sym = Config.DANGO_SYMBOL_MAP[pair]
+
+        try:
+            bbo = await self._dango.get_bbo(dango_sym)
+            price = bbo["mark"]
+        except Exception as e:
+            logger.warning("BBO 조회 실패: %s", e)
+            await asyncio.sleep(5)
+            return
+
+        self.bot_state.position = Position(
+            pair=pair,
+            direction=direction,
+            entry_balance=equity,
+            target_notional=notional,
+            avg_entry_price=price,
+        )
+        self._transition(State.ANALYZE)
+
+    # ──────────────────────────────────────────────
+    # ANALYZE
+    # ──────────────────────────────────────────────
+
+    async def _state_analyze(self):
+        pos = self.bot_state.position
+        logger.info("ANALYZE: %s %s notional=$%.0f", pos.pair, pos.direction.value, pos.target_notional)
+        # 간단한 사전 체크 (추가 검증 필요 시 여기서)
+        self._transition(State.ENTER)
+
+    # ──────────────────────────────────────────────
+    # ENTER — Dango-first XEMM 5청크
+    # ──────────────────────────────────────────────
+
+    async def _state_enter(self):
+        pos = self.bot_state.position
+        logger.info("ENTER 시작: %s %s", pos.pair, pos.direction.value)
+
+        for chunk_idx in range(1, Config.ENTRY_CHUNKS + 1):
+            success = await self._xemm_chunk(
+                pos=pos,
+                chunk_idx=chunk_idx,
+                total_chunks=Config.ENTRY_CHUNKS,
+                reduce_only=False,
+            )
+            if not success:
+                logger.error("ENTER 청크 %d 실패 — 진입 취소, COOLDOWN", chunk_idx)
+                # 부분 진입 시 그대로 진행 (pos.dango_size > 0이면 HOLD)
+                break
+
+        if pos.dango_size > 0:
+            bal = await self._safe_get_balance()
+            logger.info(
+                "진입 완료: chunks=%d dango=%.6f hibachi=%.6f",
+                pos.chunks_filled, pos.dango_size, pos.hibachi_size,
+            )
+            await self._tg.notify_enter(
+                pos.pair, pos.direction.value, pos.target_notional,
+                pos.avg_entry_price, self.bot_state.cycle_count + 1,
+            )
+            self._transition(State.HOLD)
+        else:
+            logger.warning("진입 체결 0건 — COOLDOWN")
+            self.bot_state.position = None
+            self._transition(State.COOLDOWN)
+
+    # ──────────────────────────────────────────────
+    # HOLD
+    # ──────────────────────────────────────────────
+
+    async def _state_hold(self):
+        pos = self.bot_state.position
+        await asyncio.sleep(30)
+
+        try:
+            bal = await self._dango.get_balance()
+            current_balance = bal["equity"]
+        except Exception:
+            current_balance = pos.entry_balance
+
+        hibachi_margin = self._margin_monitor.margin_pct
+
+        try:
+            dango_sym = Config.DANGO_SYMBOL_MAP[pos.pair]
+            bbo = await self._dango.get_bbo(dango_sym)
+            mark = bbo["mark"]
+            spread_mtm = _calc_spread_mtm(pos, mark)
+        except Exception:
+            spread_mtm = 0.0
+
+        funding = await self._fetch_funding_for_pair(pos.pair)
+        reason = should_exit(pos, current_balance, hibachi_margin, spread_mtm, funding)
+
+        if reason:
+            logger.info("청산 조건 충족: %s", reason)
+            self.bot_state.position.exit_reason = reason
+            self._transition(State.EXIT)
+
+    # ──────────────────────────────────────────────
+    # HOLD_SUSPENDED (Dango 장애)
+    # ──────────────────────────────────────────────
+
+    async def _state_hold_suspended(self):
+        pos = self.bot_state.position
+        hibachi_margin = self._margin_monitor.margin_pct
+
+        # Dango 장애 중 + Hibachi 마진 위기 → Hibachi만 먼저 청산
+        if hibachi_margin <= Config.MARGIN_EMERGENCY_PCT:
+            logger.error("HOLD_SUSPENDED + 마진 긴급 → Hibachi 강제 청산")
+            await self._emergency_close_hibachi_only(pos)
+            return
+
+        await asyncio.sleep(15)
+
+    # ──────────────────────────────────────────────
+    # EXIT — Dango-first XEMM 5청크
+    # ──────────────────────────────────────────────
+
+    async def _state_exit(self):
+        pos = self.bot_state.position
+        logger.info("EXIT 시작: %s %s reason=%s", pos.pair, pos.direction.value, pos.exit_reason)
+
+        total_to_exit = pos.dango_size
+        per_chunk = total_to_exit / Config.EXIT_CHUNKS
+        exited = 0.0
+
+        for chunk_idx in range(1, Config.EXIT_CHUNKS + 1):
+            remaining = total_to_exit - exited
+            if remaining < 1e-8:
+                break
+
+            chunk_size = min(per_chunk, remaining)
+            # 청산은 진입 반대 방향
+            exit_side = "SELL" if pos.dango_side == "BUY" else "BUY"
+            success = await self._xemm_chunk_exit(
+                pos=pos,
+                chunk_idx=chunk_idx,
+                total_chunks=Config.EXIT_CHUNKS,
+                chunk_size=chunk_size,
+                exit_side=exit_side,
+            )
+            if success:
+                exited += chunk_size
+            else:
+                self.bot_state.exit_failure_count += 1
+                if self.bot_state.exit_failure_count >= Config.MAX_EXIT_FAILURES:
+                    self._transition(State.MANUAL_INTERVENTION)
+                    return
+
+        # 청산 완료
+        self.bot_state.exit_failure_count = 0
+        bal = await self._safe_get_balance()
+        pnl = bal - pos.entry_balance if bal else 0.0
+        self.bot_state.cycle_count += 1
+
+        cycle = Cycle(
+            cycle_id=self.bot_state.cycle_count,
+            pair=pos.pair,
+            direction=pos.direction.value,
+            entry_balance=pos.entry_balance,
+            exit_balance=bal or pos.entry_balance,
+            pnl=pnl,
+            exit_reason=pos.exit_reason,
+            exit_time=time.time(),
+            chunks=pos.chunks_filled,
+        )
+        self._save_cycle(cycle)
+        await self._tg.notify_exit(pos.exit_reason, pnl, self.bot_state.cycle_count)
+
+        self.bot_state.position = None
+        self._transition(State.COOLDOWN)
+
+    # ──────────────────────────────────────────────
+    # COOLDOWN
+    # ──────────────────────────────────────────────
+
+    async def _state_cooldown(self):
+        logger.info("COOLDOWN %d분 대기", Config.COOLDOWN_MINUTES)
+        await asyncio.sleep(Config.COOLDOWN_MINUTES * 60)
+        self._transition(State.IDLE)
+
+    # ──────────────────────────────────────────────
+    # MANUAL_INTERVENTION
+    # ──────────────────────────────────────────────
+
+    async def _state_manual(self):
+        now = time.time()
+        if now - self.bot_state.last_manual_alert > 1800:
+            await self._tg.notify_manual_intervention(
+                self.bot_state.exit_failure_count, self.bot_state.cycle_count
+            )
+            self.bot_state.last_manual_alert = now
+        await asyncio.sleep(60)
+
+    # ──────────────────────────────────────────────
+    # XEMM 청크 실행 (진입)
+    # ──────────────────────────────────────────────
+
+    async def _xemm_chunk(
+        self, pos: Position, chunk_idx: int, total_chunks: int, reduce_only: bool
+    ) -> bool:
+        """
+        1청크 진입: Dango maker → 체결 시 Hibachi taker.
+        성공이면 True, 실패이면 False.
+        """
+        dango_sym = Config.DANGO_SYMBOL_MAP[pos.pair]
+        hibachi_sym = Config.HIBACHI_SYMBOL_MAP[pos.pair]
+        chunk_size = calc_chunk_size(pos.target_notional, pos.avg_entry_price, total_chunks)
+
+        concession = 0.0
+        anchor_price = None
+
+        while True:
+            if self._health_monitor.is_down:
+                logger.warning("Dango 다운 — 청크 %d 중단", chunk_idx)
+                return False
+
+            # BBO 재조회 (앵커 설정 또는 재앵커링)
+            try:
+                bbo = await self._dango.get_bbo(dango_sym)
+                spread = bbo["ask"] - bbo["bid"]
+                if anchor_price is None:
+                    anchor_price = bbo["ask"] if pos.dango_side == "BUY" else bbo["bid"]
+            except Exception as e:
+                logger.warning("BBO 조회 실패: %s", e)
+                await asyncio.sleep(2)
+                continue
+
+            # 진입 가격 계산 (concession으로 점진적 개선)
+            if pos.dango_side == "BUY":
+                price = round(anchor_price - concession, 2)
+            else:
+                price = round(anchor_price + concession, 2)
+
+            import uuid as _uuid
+            cid = str(_uuid.uuid4())[:16]
+
+            # Dango maker 주문 등록
+            try:
+                await self._dango.place_limit_order(
+                    dango_sym, pos.dango_side, price, chunk_size,
+                    reduce_only=reduce_only, post_only=True, client_order_id=cid,
+                )
+            except Exception as e:
+                logger.warning("Dango 주문 실패: %s", e)
+                await asyncio.sleep(2)
+                continue
+
+            # 체결 대기
+            fill = await self._dango.wait_for_fill(cid, timeout=Config.MAKER_FILL_TIMEOUT_SECONDS)
+
+            if fill:
+                filled_size = float(fill.get("fill_size", chunk_size))
+                fill_price = float(fill.get("fill_price", price))
+
+                # Hibachi taker 즉시 실행
+                try:
+                    hb_result = await self._hb.place_limit_order(
+                        hibachi_sym, pos.hibachi_side,
+                        fill_price, filled_size, post_only=False,
+                    )
+                    hb_price = fill_price
+                except Exception as e:
+                    logger.error("Hibachi taker 실패 (청크 %d): %s", chunk_idx, e)
+                    # Dango 포지션만 잡힌 상태 → 취소 시도
+                    await self._dango.place_market_order(dango_sym, pos.dango_side, filled_size)
+                    return False
+
+                # 포지션 업데이트
+                pos.dango_size += filled_size
+                pos.hibachi_size += filled_size
+                pos.chunks_filled += 1
+                pos.avg_entry_price = (
+                    (pos.avg_entry_price * (chunk_idx - 1) + fill_price) / chunk_idx
+                )
+                logger.info("청크 %d/%d 완료: %.6f @ %.2f", chunk_idx, total_chunks, filled_size, fill_price)
+                return True
+
+            # 미체결 → 취소 후 재시도
+            await self._dango.cancel_order_by_client_id(dango_sym, cid)
+            concession += Config.MAKER_PRICE_STEP_USD
+
+            # BBO 재앵커링 조건
+            if spread > 0 and concession > spread * 0.5:
+                logger.debug("BBO 재앵커링 (concession=%.4f > spread/2=%.4f)", concession, spread / 2)
+                anchor_price = None
+                concession = 0.0
+
+    # ──────────────────────────────────────────────
+    # XEMM 청크 실행 (청산)
+    # ──────────────────────────────────────────────
+
+    async def _xemm_chunk_exit(
+        self, pos: Position, chunk_idx: int, total_chunks: int,
+        chunk_size: float, exit_side: str,
+    ) -> bool:
+        dango_sym = Config.DANGO_SYMBOL_MAP[pos.pair]
+        hibachi_sym = Config.HIBACHI_SYMBOL_MAP[pos.pair]
+        hibachi_close_side = "BUY" if pos.hibachi_side == "SELL" else "SELL"
+
+        concession = 0.0
+        anchor_price = None
+
+        while True:
+            if self._health_monitor.is_down:
+                logger.warning("Dango 다운 — EXIT 청크 %d 중단", chunk_idx)
+                return False
+
+            try:
+                bbo = await self._dango.get_bbo(dango_sym)
+                spread = bbo["ask"] - bbo["bid"]
+                if anchor_price is None:
+                    anchor_price = bbo["bid"] if exit_side == "SELL" else bbo["ask"]
+            except Exception as e:
+                logger.warning("EXIT BBO 조회 실패: %s", e)
+                await asyncio.sleep(2)
+                continue
+
+            if exit_side == "SELL":
+                price = round(anchor_price + concession, 2)
+            else:
+                price = round(anchor_price - concession, 2)
+
+            import uuid as _uuid
+            cid = str(_uuid.uuid4())[:16]
+
+            try:
+                await self._dango.place_limit_order(
+                    dango_sym, exit_side, price, chunk_size,
+                    reduce_only=True, post_only=True, client_order_id=cid,
+                )
+            except Exception as e:
+                logger.warning("EXIT Dango 주문 실패: %s", e)
+                await asyncio.sleep(2)
+                continue
+
+            fill = await self._dango.wait_for_fill(cid, timeout=Config.MAKER_FILL_TIMEOUT_SECONDS)
+
+            if fill:
+                filled_size = float(fill.get("fill_size", chunk_size))
+                fill_price = float(fill.get("fill_price", price))
+
+                try:
+                    await self._hb.place_limit_order(
+                        hibachi_sym, hibachi_close_side,
+                        fill_price, filled_size, post_only=False,
+                    )
+                except Exception as e:
+                    logger.error("EXIT Hibachi taker 실패 (청크 %d): %s", chunk_idx, e)
+                    return False
+
+                pos.dango_size -= filled_size
+                pos.hibachi_size -= filled_size
+                logger.info("EXIT 청크 %d/%d: %.6f @ %.2f", chunk_idx, total_chunks, filled_size, fill_price)
+                return True
+
+            await self._dango.cancel_order_by_client_id(dango_sym, cid)
+            concession += Config.MAKER_PRICE_STEP_USD
+
+            if spread > 0 and concession > spread * 0.5:
+                anchor_price = None
+                concession = 0.0
+
+    # ──────────────────────────────────────────────
+    # 긴급 Hibachi-only 청산
+    # ──────────────────────────────────────────────
+
+    async def _emergency_close_hibachi_only(self, pos: Position):
+        """Dango 다운 + 마진 긴급: Hibachi만 시장가 청산"""
+        hibachi_sym = Config.HIBACHI_SYMBOL_MAP[pos.pair]
+        hibachi_close_side = "BUY" if pos.hibachi_side == "SELL" else "SELL"
+        try:
+            await self._hb.place_limit_order(
+                hibachi_sym, hibachi_close_side,
+                await self._hb.get_mark_price(hibachi_sym),
+                pos.hibachi_size, post_only=False,
+            )
+            logger.error("Hibachi 긴급 청산 완료. Dango 수동 청산 필요!")
+            await self._tg.notify_hibachi_closed_only(pos.dango_size)
+        except Exception as e:
+            logger.error("Hibachi 긴급 청산 실패: %s", e)
+
+    # ──────────────────────────────────────────────
+    # 모니터 콜백
+    # ──────────────────────────────────────────────
+
+    async def _on_margin_emergency(self, pct: float):
+        await self._tg.notify_margin_warning("Hibachi", pct)
+        s = self.bot_state.state
+        if s == State.HOLD:
+            self.bot_state.position.exit_reason = f"MARGIN_EMERGENCY ({pct:.1f}%)"
+            self._transition(State.EXIT)
+
+    async def _on_dango_down(self):
+        await self._tg.notify_dango_down()
+        if self.bot_state.state == State.HOLD:
+            self.bot_state.suspended_since = time.time()
+            self._transition(State.HOLD_SUSPENDED)
+
+    async def _on_dango_up(self):
+        await self._tg.notify_dango_up()
+        if self.bot_state.state == State.HOLD_SUSPENDED:
+            self.bot_state.suspended_since = None
+            self._transition(State.HOLD)
+
+    # ──────────────────────────────────────────────
+    # 유틸리티
+    # ──────────────────────────────────────────────
+
+    def _transition(self, new_state: State):
+        old = self.bot_state.state
+        self.bot_state.state = new_state
+        logger.info("상태 전환: %s → %s", old.value, new_state.value)
+        self.bot_state.save(self._state_path)
+
+    async def _safe_get_balance(self) -> Optional[float]:
+        try:
+            bal = await self._dango.get_balance()
+            return bal["equity"]
+        except Exception:
+            return None
+
+    async def _fetch_funding_for_pair(self, pair: str) -> dict:
+        try:
+            dango_fr = await self._dango.get_funding_rate(Config.DANGO_SYMBOL_MAP[pair])
+            hibachi_fr = await self._hb.get_funding_rate(Config.HIBACHI_SYMBOL_MAP[pair])
+            return {pair: {"dango": dango_fr, "hibachi": hibachi_fr}}
+        except Exception:
+            return {}
+
+    def _save_cycle(self, cycle: Cycle):
+        with open(self._cycles_path, "a") as f:
+            f.write(cycle.to_jsonl() + "\n")
+
+    async def _shutdown(self):
+        logger.info("엔진 종료 중...")
+        await self._margin_monitor.stop()
+        await self._health_monitor.stop()
+        await self._dango.stop()
+        await self._tg.stop()
+
+
+def _calc_spread_mtm(pos: Position, mark_price: float) -> float:
+    """스프레드 MTM 추정 (USD). 진입가 대비 현재 마크 가격 차이."""
+    if pos.direction == Direction.A:
+        # Dango LONG: mark > entry → 이익
+        return (mark_price - pos.avg_entry_price) * pos.dango_size
+    else:
+        return (pos.avg_entry_price - mark_price) * pos.dango_size

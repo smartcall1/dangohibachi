@@ -1,0 +1,97 @@
+"""환경변수 기반 설정"""
+import os
+from dotenv import load_dotenv
+
+_ROOT = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(_ROOT, ".env"))
+
+
+class Config:
+    # Dango
+    DANGO_PRIVATE_KEY: str = os.getenv("DANGO_PRIVATE_KEY", "")
+    DANGO_ACCOUNT_ADDRESS: str = os.getenv("DANGO_ACCOUNT_ADDRESS", "")
+    DANGO_PERPS_CONTRACT: str = os.getenv(
+        "DANGO_PERPS_CONTRACT", "0x90bc84df68d1aa59a857e04ed529e9a26edbea4f"
+    )
+    DANGO_CHAIN_ID: str = os.getenv("DANGO_CHAIN_ID", "dango-1")
+    DANGO_GQL_URL: str = "https://api-mainnet.dango.zone/graphql"
+    DANGO_WS_URL: str = "wss://api-mainnet.dango.zone/graphql"
+
+    # Hibachi
+    HIBACHI_API_KEY: str = os.getenv("HIBACHI_API_KEY", "")
+    HIBACHI_PRIVATE_KEY: str = os.getenv("HIBACHI_PRIVATE_KEY", "")
+    HIBACHI_PUBLIC_KEY: str = os.getenv("HIBACHI_PUBLIC_KEY", "")
+    HIBACHI_ACCOUNT_ID: str = os.getenv("HIBACHI_ACCOUNT_ID", "")
+
+    # 거래 설정
+    LEVERAGE: int = int(os.getenv("LEVERAGE", "3"))
+    PAIRS: list = ["ETH", "BTC", "SOL", "HYPE"]
+    ENTRY_CHUNKS: int = 5
+    EXIT_CHUNKS: int = 5
+
+    # 심볼 매핑
+    DANGO_SYMBOL_MAP: dict = {
+        "ETH": "perp/ethusd",
+        "BTC": "perp/btcusd",
+        "SOL": "perp/solusd",
+        "HYPE": "perp/hypeusd",
+    }
+    HIBACHI_SYMBOL_MAP: dict = {
+        "ETH": "ETH/USDT-P",
+        "BTC": "BTC/USDT-P",
+        "SOL": "SOL/USDT-P",
+        "HYPE": "HYPE/USDT-P",
+    }
+
+    # 보유 시간
+    MIN_HOLD_MINUTES: int = int(os.getenv("MIN_HOLD_MINUTES", "30"))
+    MAX_HOLD_DAYS: int = int(os.getenv("MAX_HOLD_DAYS", "4"))
+    COOLDOWN_MINUTES: int = int(os.getenv("COOLDOWN_MINUTES", "5"))
+
+    # 청산 임계값
+    MARGIN_EMERGENCY_PCT: float = float(os.getenv("MARGIN_EMERGENCY_PCT", "10"))
+    MARGIN_WARNING_PCT: float = float(os.getenv("MARGIN_WARNING_PCT", "15"))
+    SPREAD_OPPORTUNISTIC_USD: float = float(os.getenv("SPREAD_OPPORTUNISTIC_USD", "30"))
+    PRINCIPAL_BUFFER_USD: float = float(os.getenv("PRINCIPAL_BUFFER_USD", "10"))
+
+    # XEMM 실행
+    MAKER_FILL_TIMEOUT_SECONDS: int = int(os.getenv("MAKER_FILL_TIMEOUT_SECONDS", "60"))
+    MAKER_PRICE_STEP_USD: float = float(os.getenv("MAKER_PRICE_STEP_USD", "0.01"))
+    EMERGENCY_CLOSE_SLIPPAGE_PCT: float = float(os.getenv("EMERGENCY_CLOSE_SLIPPAGE_PCT", "0.05"))
+    MAX_EXIT_FAILURES: int = int(os.getenv("MAX_EXIT_FAILURES", "3"))
+
+    # 수수료 (왕복)
+    DANGO_MAKER_FEE: float = 0.0
+    HIBACHI_TAKER_FEE: float = 0.00045
+    ROUND_TRIP_FEE_RATE: float = 0.0009  # 0.09%
+
+    # 텔레그램
+    TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
+
+    # 폴링
+    POLL_FUNDING_SECONDS: int = int(os.getenv("POLL_FUNDING_SECONDS", "300"))
+
+    LOG_DIR: str = os.path.join(_ROOT, "logs")
+
+    @classmethod
+    def ensure_dirs(cls):
+        os.makedirs(cls.LOG_DIR, exist_ok=True)
+
+    @classmethod
+    def validate(cls) -> list[str]:
+        errors = []
+        required = {
+            "DANGO_PRIVATE_KEY": cls.DANGO_PRIVATE_KEY,
+            "DANGO_ACCOUNT_ADDRESS": cls.DANGO_ACCOUNT_ADDRESS,
+            "HIBACHI_API_KEY": cls.HIBACHI_API_KEY,
+            "HIBACHI_PRIVATE_KEY": cls.HIBACHI_PRIVATE_KEY,
+            "HIBACHI_PUBLIC_KEY": cls.HIBACHI_PUBLIC_KEY,
+            "HIBACHI_ACCOUNT_ID": cls.HIBACHI_ACCOUNT_ID,
+            "TELEGRAM_BOT_TOKEN": cls.TELEGRAM_BOT_TOKEN,
+            "TELEGRAM_CHAT_ID": cls.TELEGRAM_CHAT_ID,
+        }
+        for name, val in required.items():
+            if not val:
+                errors.append(f"{name} 미설정")
+        return errors

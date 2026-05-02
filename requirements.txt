@@ -1,0 +1,6 @@
+httpx>=0.27
+websockets>=12.0
+eth-keys>=0.5
+python-dotenv>=1.0
+python-telegram-bot>=20.0
+hibachi-xyz
