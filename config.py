@@ -78,7 +78,9 @@ class Config:
     MAKER_PRICE_STEP_USD: float = float(os.getenv("MAKER_PRICE_STEP_USD", "0.01"))
     # 청크당 maker 재시도 한도 — 무한 루프 방지 (delta_donemoji XEMM 패턴)
     MAKER_RETRY_LIMIT: int = int(os.getenv("MAKER_RETRY_LIMIT", "5"))
-    EMERGENCY_CLOSE_SLIPPAGE_PCT: float = float(os.getenv("EMERGENCY_CLOSE_SLIPPAGE_PCT", "0.05"))
+    # Dango perps는 페어별 max_slippage 캡이 있음 (BTC=0.02). 그 이상은 거부됨.
+    # 5%로 두면 모든 BTC 롤백 시장가가 deliver_tx에서 거부 → 편측 노출 위험.
+    EMERGENCY_CLOSE_SLIPPAGE_PCT: float = float(os.getenv("EMERGENCY_CLOSE_SLIPPAGE_PCT", "0.02"))
     MAX_EXIT_FAILURES: int = int(os.getenv("MAX_EXIT_FAILURES", "3"))
     # dust 임계 (notional USD) — 양쪽 합 미만이면 외부 정리/청산 완료로 간주, IDLE 전환
     # nado_grvt ed32123 / "5청크 후 dust 갇힘" 회귀 방지

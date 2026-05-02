@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import time
 from typing import Optional
@@ -20,6 +21,16 @@ from strategy import (
 from telegram_ui import TelegramUI
 
 logger = logging.getLogger(__name__)
+
+
+def _quantize_to_tick(price: float, tick: float) -> float:
+    """가격을 tick 배수로 양자화. float 부동소수점 오차까지 제거.
+    예: 78714.40000000001 → 78714.4 (tick=0.1)
+    'Price X is not a multiple of tick size' 거부 회귀 방지."""
+    if tick <= 0:
+        return price
+    decimals = max(0, -int(math.floor(math.log10(tick))))
+    return round(round(price / tick) * tick, decimals)
 
 
 class Engine:
@@ -331,8 +342,29 @@ class Engine:
                 # 부분 진입 시 그대로 진행 (pos.dango_size > 0이면 HOLD)
                 break
 
+        # 진입 완료 후 실측 재동기화 — 양쪽 실제 포지션을 봇 상태에 반영
+        # (nado_grvt acba425 패턴 — bot 내부 상태와 거래소 실측 불일치 방지)
+        try:
+            real_d = await self._dango.get_position_signed_size(Config.DANGO_SYMBOL_MAP[pos.pair])
+            real_h = await self._hb.get_position_signed_size(Config.HIBACHI_SYMBOL_MAP[pos.pair])
+            d_abs, h_abs = abs(real_d), abs(real_h)
+            if abs(d_abs - h_abs) > min(d_abs, h_abs) * 0.05:
+                logger.error(
+                    "진입 후 양쪽 사이즈 불일치 (dango=%.6f hibachi=%.6f, 차이>5%%) → MANUAL",
+                    d_abs, h_abs,
+                )
+                pos.dango_size = d_abs
+                pos.hibachi_size = h_abs
+                self._transition(State.MANUAL_INTERVENTION)
+                return
+            # 일치 (±5%) — 실측으로 보정
+            pos.dango_size = d_abs
+            pos.hibachi_size = h_abs
+        except Exception as e:
+            logger.warning("진입 후 실측 동기화 실패 (내부 상태 유지): %s", e)
+
         if pos.dango_size > 0:
-            bal = await self._safe_get_balance()
+            await self._safe_get_balance()
             logger.info(
                 "진입 완료: chunks=%d dango=%.6f hibachi=%.6f",
                 pos.chunks_filled, pos.dango_size, pos.hibachi_size,
@@ -556,20 +588,17 @@ class Engine:
                 continue
             spread = bbo["ask"] - bbo["bid"]
             # Maker 가격 로직 — POST_ONLY cross 방지 (Dango 에러 "would cross best bid" 회귀 방지)
-            # BUY maker: best_bid에서 출발, concession만큼 ask 쪽으로 이동 (ask-tick 이하로 hard cap)
-            # SELL maker: best_ask에서 출발, concession만큼 bid 쪽으로 이동 (bid+tick 이상으로 hard cap)
             if pos.dango_side == "BUY":
                 raw = bbo["bid"] + concession
                 raw = min(raw, bbo["ask"] - tick)
             else:
                 raw = bbo["ask"] - concession
                 raw = max(raw, bbo["bid"] + tick)
-            price = round(raw / tick) * tick
-            # 라운딩 후 cross 재검증
+            price = _quantize_to_tick(raw, tick)
             if pos.dango_side == "BUY":
-                price = min(price, bbo["ask"] - tick)
+                price = min(price, _quantize_to_tick(bbo["ask"] - tick, tick))
             else:
-                price = max(price, bbo["bid"] + tick)
+                price = max(price, _quantize_to_tick(bbo["bid"] + tick, tick))
 
             cid = self._dango.make_client_order_id()
 
@@ -617,7 +646,7 @@ class Engine:
                 hb_size_before = await self._hb.get_position_signed_size(hibachi_sym)
                 slip = 1.005 if pos.hibachi_side == "BUY" else 0.995
                 hb_tick = Config.HIBACHI_TICK_SIZE.get(pos.pair, 0.01)
-                hb_taker_price = round(fill_price * slip / hb_tick) * hb_tick
+                hb_taker_price = _quantize_to_tick(fill_price * slip, hb_tick)
                 await self._hb.place_limit_order(
                     hibachi_sym, pos.hibachi_side, hb_taker_price,
                     actual_filled, post_only=False,
@@ -700,14 +729,14 @@ class Engine:
             if exit_side == "BUY":
                 raw = bbo["bid"] + concession
                 raw = min(raw, bbo["ask"] - tick)
-            else:  # SELL
+            else:
                 raw = bbo["ask"] - concession
                 raw = max(raw, bbo["bid"] + tick)
-            price = round(raw / tick) * tick
+            price = _quantize_to_tick(raw, tick)
             if exit_side == "BUY":
-                price = min(price, bbo["ask"] - tick)
+                price = min(price, _quantize_to_tick(bbo["ask"] - tick, tick))
             else:
-                price = max(price, bbo["bid"] + tick)
+                price = max(price, _quantize_to_tick(bbo["bid"] + tick, tick))
 
             cid = self._dango.make_client_order_id()
 
@@ -754,7 +783,7 @@ class Engine:
                 hb_size_before = await self._hb.get_position_signed_size(hibachi_sym)
                 slip = 1.005 if hibachi_close_side == "BUY" else 0.995
                 hb_tick = Config.HIBACHI_TICK_SIZE.get(pos.pair, 0.01)
-                hb_taker_price = round(fill_price * slip / hb_tick) * hb_tick
+                hb_taker_price = _quantize_to_tick(fill_price * slip, hb_tick)
                 await self._hb.place_limit_order(
                     hibachi_sym, hibachi_close_side, hb_taker_price,
                     actual_filled, post_only=False,
