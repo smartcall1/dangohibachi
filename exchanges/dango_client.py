@@ -23,8 +23,11 @@ _GQL_SUBSCRIBE = "subscribe"
 _GQL_NEXT = "next"
 _GQL_ERROR = "error"
 _GQL_COMPLETE = "complete"
+_GQL_PING = "ping"
+_GQL_PONG = "pong"
 
 _GQL_WS_SUBPROTOCOL = "graphql-transport-ws"
+_GQL_KEEPALIVE_INTERVAL = 15  # GraphQL ping 주기 — Dango 30s 타임아웃 회피용
 
 
 def _canonical_json(obj: Any) -> str:
@@ -577,7 +580,9 @@ class DangoClient:
         err = self._parse_broadcast_error(result)
         if err:
             raise RuntimeError(f"Dango limit order failed: {err}")
-        logger.info("Dango limit order placed: %s %s %s@%.4f cid=%s", pair_id, side, size, price, cid)
+        tx_hash = (result or {}).get("tx_hash", "?")
+        logger.info("Dango limit order placed: %s %s %s@%.4f cid=%s tx=%s",
+                    pair_id, side, size, price, cid, tx_hash[:16])
         return cid
 
     async def cancel_order_by_client_id(self, pair_id: str, client_order_id: str) -> dict:
@@ -707,19 +712,38 @@ class DangoClient:
                     logger.info("Dango WS 구독 시작 (order_filled, user=%s)", self._addr)
                     retry_delay = 2
 
-                    async for raw in ws:
-                        msg = json.loads(raw)
-                        msg_type = msg.get("type")
-                        if msg_type == _GQL_NEXT:
-                            payload = msg.get("payload", {})
-                            events_data = payload.get("data", {}).get("events")
-                            if events_data and events_data.get("type") == "order_filled":
-                                self._on_fill_event(events_data)
-                        elif msg_type == _GQL_ERROR:
-                            logger.error("Dango WS 구독 에러: %s", msg.get("payload"))
-                        elif msg_type == _GQL_COMPLETE:
-                            logger.warning("Dango WS 구독 종료됨")
-                            break
+                    # Dango 서버 30s "registered timeout" 회피: 15s마다 ping 송신
+                    async def _keepalive():
+                        try:
+                            while True:
+                                await asyncio.sleep(_GQL_KEEPALIVE_INTERVAL)
+                                await ws.send(json.dumps({"type": _GQL_PING}))
+                        except (asyncio.CancelledError, ConnectionClosed):
+                            return
+
+                    keepalive_task = asyncio.create_task(_keepalive())
+
+                    try:
+                        async for raw in ws:
+                            msg = json.loads(raw)
+                            msg_type = msg.get("type")
+                            if msg_type == _GQL_NEXT:
+                                payload = msg.get("payload", {})
+                                events_data = payload.get("data", {}).get("events")
+                                if events_data and events_data.get("type") == "order_filled":
+                                    self._on_fill_event(events_data)
+                            elif msg_type == _GQL_PING:
+                                # 서버 ping → pong 응답 (graphql-transport-ws spec)
+                                await ws.send(json.dumps({"type": _GQL_PONG}))
+                            elif msg_type == _GQL_PONG:
+                                pass  # 우리가 보낸 ping에 대한 응답 — 무시
+                            elif msg_type == _GQL_ERROR:
+                                logger.error("Dango WS 구독 에러: %s", msg.get("payload"))
+                            elif msg_type == _GQL_COMPLETE:
+                                logger.warning("Dango WS 구독 종료됨")
+                                break
+                    finally:
+                        keepalive_task.cancel()
 
             except ConnectionClosed as e:
                 if not self._running:
