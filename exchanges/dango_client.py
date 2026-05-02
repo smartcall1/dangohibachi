@@ -306,6 +306,37 @@ class DangoClient:
             return tx_result["Err"].get("error", "unknown error")
         return None
 
+    async def _verify_tx_committed(self, tx_hash: str, max_wait_s: float = 8.0) -> Optional[str]:
+        """tx_hash가 블록에 포함되고 deliver_tx 성공인지 indexer로 확인.
+        성공 시 None, 실패 시 에러 메시지 반환. 타임아웃 시 'verification timeout'."""
+        if not tx_hash or tx_hash == "?":
+            return None  # 검증 불가 — 기존 동작 유지
+        query = (
+            '{transactions(hash:"' + tx_hash +
+            '", first:1){nodes{hasSucceeded errorMessage gasUsed}}}'
+        )
+        deadline = asyncio.get_event_loop().time() + max_wait_s
+        delay = 0.4
+        while asyncio.get_event_loop().time() < deadline:
+            try:
+                resp = await self._http.post(
+                    self._gql_url,
+                    json={"query": query},
+                    headers={"Content-Type": "application/json"},
+                )
+                data = resp.json()
+                nodes = (data.get("data") or {}).get("transactions", {}).get("nodes", [])
+                if nodes:
+                    node = nodes[0]
+                    if node.get("hasSucceeded"):
+                        return None
+                    return node.get("errorMessage") or "deliver_tx failed (no error message)"
+            except Exception:
+                pass
+            await asyncio.sleep(delay)
+            delay = min(delay * 1.4, 1.5)
+        return "verification timeout — tx not indexed within %.1fs" % max_wait_s
+
     async def _broadcast_once(self, msg: dict, user_index: int) -> dict:
         """단일 broadcastTxSync 전송 (user_index 지정)"""
         nonce = await self._next_nonce()
@@ -545,6 +576,13 @@ class DangoClient:
     # 주문 실행
     # ──────────────────────────────────────────────
 
+    @staticmethod
+    def make_client_order_id() -> str:
+        """Dango contract는 client_order_id를 u64로 파싱 — 숫자 문자열 (ns timestamp + 랜덤 3자리)."""
+        import time as _time
+        import random as _random
+        return str(_time.time_ns() // 1000 * 1000 + _random.randint(0, 999))
+
     async def place_limit_order(
         self,
         pair_id: str,
@@ -555,8 +593,8 @@ class DangoClient:
         post_only: bool = True,
         client_order_id: Optional[str] = None,
     ) -> str:
-        """Maker 지정가 주문 전송. client_order_id 반환."""
-        cid = client_order_id or str(uuid.uuid4())[:16]
+        """Maker 지정가 주문 전송. client_order_id 반환 (u64 숫자 문자열)."""
+        cid = client_order_id or self.make_client_order_id()
         # Dango: size는 LONG이면 양수, SHORT면 음수
         signed_size = size if side.upper() == "BUY" else -size
         tif = "POST" if post_only else "GTC"
@@ -580,8 +618,14 @@ class DangoClient:
         result = await self._broadcast(msg)
         err = self._parse_broadcast_error(result)
         if err:
-            raise RuntimeError(f"Dango limit order failed: {err}")
+            raise RuntimeError(f"Dango limit order failed (check_tx): {err}")
         tx_hash = (result or {}).get("tx_hash", "?")
+
+        # check_tx 통과 후에도 deliver_tx에서 실패할 수 있음 — indexer로 확정
+        deliver_err = await self._verify_tx_committed(tx_hash)
+        if deliver_err:
+            raise RuntimeError(f"Dango limit order failed (deliver_tx): {deliver_err}")
+
         logger.info("Dango limit order placed: %s %s %s@%.4f cid=%s tx=%s",
                     pair_id, side, size, price, cid, tx_hash[:16])
         return cid

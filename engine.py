@@ -489,8 +489,7 @@ class Engine:
             else:
                 price = round(anchor_price + concession, 2)
 
-            import uuid as _uuid
-            cid = str(_uuid.uuid4())[:16]
+            cid = self._dango.make_client_order_id()
 
             # Dango maker 주문 등록
             try:
@@ -578,8 +577,7 @@ class Engine:
             else:
                 price = round(anchor_price - concession, 2)
 
-            import uuid as _uuid
-            cid = str(_uuid.uuid4())[:16]
+            cid = self._dango.make_client_order_id()
 
             try:
                 await self._dango.place_limit_order(
