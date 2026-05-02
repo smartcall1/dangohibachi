@@ -7,9 +7,8 @@ import hashlib
 import json
 import logging
 import os
-import time
 import uuid
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 import httpx
 import websockets
@@ -54,7 +53,7 @@ def _sha256(data: bytes) -> bytes:
     return hashlib.sha256(data).digest()
 
 
-def _sign_secp256k1(hash_bytes: bytes, private_key_hex: str) -> str:
+def _sign_raw(hash_bytes: bytes, private_key_hex: str) -> str:
     """secp256k1 raw sign → 64바이트 base64 (r+s, no recovery id)"""
     from eth_keys import keys as eth_keys
 
@@ -65,20 +64,58 @@ def _sign_secp256k1(hash_bytes: bytes, private_key_hex: str) -> str:
     return base64.b64encode(raw).decode()
 
 
-def _derive_key_hash(private_key_hex: str) -> str:
-    """SHA-256(압축 공개키) → 64자 hex (Dango credential key_hash)"""
+def _build_msg_types(type_name: str, value: Any, types_acc: dict) -> Optional[str]:
+    """message 값에서 EIP-712 struct 타입을 재귀적으로 추론한다.
+    types_acc에 타입 정의 누적, 반환값 = EIP-712 타입 이름 (primitive이면 string/bool/uint32)."""
+    _ADDR_KEYS = frozenset({"contract", "sender", "verifyingContract"})
+    _BOOL_KEYS = frozenset({"reduce_only"})
+    _UINT32_KEYS = frozenset({"user_index", "nonce", "gas_limit"})
+
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, int):
+        return "uint32"
+    if isinstance(value, str):
+        return "string"
+    if value is None:
+        return None
+    if isinstance(value, list):
+        if not value:
+            types_acc.setdefault(type_name, [])
+            return f"{type_name}[]"
+        elem_type = _build_msg_types(type_name, value[0], types_acc)
+        return f"{elem_type}[]"
+    if isinstance(value, dict):
+        fields = []
+        for k, v in value.items():
+            if k in _ADDR_KEYS:
+                ftype: Optional[str] = "address"
+            elif k in _BOOL_KEYS or isinstance(v, bool):
+                ftype = "bool"
+            elif k in _UINT32_KEYS or (isinstance(v, int) and not isinstance(v, bool)):
+                ftype = "uint32"
+            elif isinstance(v, (dict, list)):
+                child = type_name + "".join(p.capitalize() for p in k.split("_"))
+                ftype = _build_msg_types(child, v, types_acc)
+            else:
+                ftype = "string"
+            if ftype is not None:
+                fields.append({"name": k, "type": ftype})
+        types_acc[type_name] = fields
+        return type_name
+    return "string"
+
+
+def _derive_key_hash_ethereum(private_key_hex: str) -> str:
+    """SHA-256('0x' + lowercase_eth_address UTF-8) → 대문자 hex (ethereum 키 타입)"""
+    from eth_hash.auto import keccak
     from eth_keys import keys as eth_keys
 
     pk_bytes = bytes.fromhex(private_key_hex.lstrip("0x"))
     pk = eth_keys.PrivateKey(pk_bytes)
-    # 압축 공개키: 33바이트
-    pub_uncompressed = pk.public_key.to_bytes()  # 64바이트 (prefix 없음)
-    # x 좌표로 압축 공개키 구성
-    x = pub_uncompressed[:32]
-    y_last_byte = pub_uncompressed[63]
-    prefix = b"\x02" if (y_last_byte % 2 == 0) else b"\x03"
-    compressed = prefix + x
-    return hashlib.sha256(compressed).hexdigest()
+    pub = pk.public_key.to_bytes()  # 64B
+    eth_addr = "0x" + keccak(pub)[-20:].hex()  # EIP-55 없이 소문자
+    return hashlib.sha256(eth_addr.encode("utf-8")).hexdigest().upper()
 
 
 class DangoClient:
@@ -109,17 +146,13 @@ class DangoClient:
         self._chain_id = chain_id
         self._gql_url = gql_url
         self._ws_url = ws_url
-        self._key_hash = _derive_key_hash(private_key)
 
-        # 논스: 파일 기반 순차적 증분 (Dango 서버 MAX_NONCE_INCREASE 제약 대응)
-        self._nonce_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".dango_nonce")
-        self._nonce = 4  # 기본값 (에러 로그에서 마지막 값이 3이었음)
-        if os.path.exists(self._nonce_file):
-            try:
-                with open(self._nonce_file, "r") as f:
-                    self._nonce = int(f.read().strip())
-            except Exception:
-                pass
+        # key_hash + 서명 타입 — start()에서 factory 조회로 초기화됨
+        self._key_hash: str = ""
+        self._key_type: str = "secp256k1"  # "secp256k1" | "ethereum"
+
+        # Dango nonce는 순차 증분 — 계정 최초 논스 4부터 시작, 재시작 시 에러 자동 보정
+        self._nonce: int = 4
         self._nonce_lock = asyncio.Lock()
 
         # Dango 계정 인덱스 (첫 주문 시 자동 탐색)
@@ -141,43 +174,117 @@ class DangoClient:
     async def _next_nonce(self) -> int:
         async with self._nonce_lock:
             self._nonce += 1
-            try:
-                with open(self._nonce_file, "w") as f:
-                    f.write(str(self._nonce))
-            except Exception as e:
-                logger.warning("nonce 파일 저장 실패: %s", e)
             return self._nonce
+
+    def _extract_chain_nonce(self, err: str) -> Optional[int]:
+        """에러 메시지에서 체인 현재 논스를 파싱. 'too far ahead: X > Y + ...' → Y 반환."""
+        import re
+        m = re.search(r"nonce is too far ahead: \d+ > (\d+) \+", err)
+        if m:
+            return int(m.group(1))
+        return None
 
     # ──────────────────────────────────────────────
     # 서명 & 트랜잭션 구성
     # ──────────────────────────────────────────────
 
-    def _build_tx(self, msg: dict, nonce: int, user_index: int, gas_limit: int = 2_000_000) -> dict:
-        sign_doc = {
-            "chain_id": self._chain_id,
-            "expiry": None,
-            "gas_limit": gas_limit,
-            "messages": [{"execute": {"contract": self._contract, "funds": {}, "msg": msg}}],
-            "nonce": nonce,
+    def _sign_eip712(self, inner_msg: dict, gas_limit: int, nonce: int, user_index: int) -> tuple:
+        """EIP-712 TypedData 구성 + 서명. Returns (typed_data_b64, sig_b64)."""
+        from eth_account import Account
+
+        execute_msg = {"execute": {"contract": self._contract, "msg": inner_msg, "funds": {}}}
+        metadata = {"user_index": user_index, "chain_id": self._chain_id, "nonce": nonce}
+        message = {
             "sender": self._addr,
+            "data": metadata,
+            "gas_limit": gas_limit,
+            "messages": [execute_msg],
         }
-        canonical = _canonical_json(sign_doc)
-        hash_bytes = _sha256(canonical.encode())
-        sig_b64 = _sign_secp256k1(hash_bytes, self._pk)
+        domain = {"name": "dango", "chainId": 1, "verifyingContract": self._addr}
+
+        # inner_msg 구조에서 타입 재귀 추론
+        inner_types: dict = {}
+        _build_msg_types("ExecuteMessage0", inner_msg, inner_types)
+
+        msg_types = {
+            "Metadata": [
+                {"name": "user_index", "type": "uint32"},
+                {"name": "chain_id", "type": "string"},
+                {"name": "nonce", "type": "uint32"},
+            ],
+            "Message": [
+                {"name": "sender", "type": "address"},
+                {"name": "data", "type": "Metadata"},
+                {"name": "gas_limit", "type": "uint32"},
+                {"name": "messages", "type": "TxMessage[]"},
+            ],
+            "TxMessage": [{"name": "execute", "type": "Execute0"}],
+            "Execute0": [
+                {"name": "contract", "type": "address"},
+                {"name": "msg", "type": "ExecuteMessage0"},
+                {"name": "funds", "type": "Funds0"},
+            ],
+            "Funds0": [],
+            **inner_types,
+        }
+
+        full_typed_data = {
+            "types": {
+                "EIP712Domain": [
+                    {"name": "name", "type": "string"},
+                    {"name": "chainId", "type": "uint256"},
+                    {"name": "verifyingContract", "type": "address"},
+                ],
+                **msg_types,
+            },
+            "primaryType": "Message",
+            "domain": domain,
+            "message": message,
+        }
+
+        pk_bytes = bytes.fromhex(self._pk.lstrip("0x"))
+        acct = Account.from_key(pk_bytes)
+        signed = acct.sign_typed_data(full_message=full_typed_data)
+
+        # 65B: r(32)+s(32)+recovery_id(1). eth_account v=27/28 → 0/1 정규화
+        sig_bytes = bytes(signed.signature)
+        r_s = sig_bytes[:64]
+        v = sig_bytes[64]
+        recovery_id = v - 27 if v >= 27 else v
+        sig_b64 = base64.b64encode(r_s + bytes([recovery_id])).decode()
+
+        typed_data_b64 = base64.b64encode(
+            json.dumps(full_typed_data, separators=(",", ":")).encode()
+        ).decode()
+
+        return typed_data_b64, sig_b64
+
+    def _build_tx(self, msg: dict, nonce: int, user_index: int, gas_limit: int = 2_000_000) -> dict:
+        execute_msgs = [{"execute": {"contract": self._contract, "funds": {}, "msg": msg}}]
+        tx_data = {"chain_id": self._chain_id, "nonce": nonce, "user_index": user_index}
+
+        if self._key_type == "ethereum":
+            typed_data_b64, sig_b64 = self._sign_eip712(msg, gas_limit, nonce, user_index)
+            signature = {"eip712": {"typed_data": typed_data_b64, "sig": sig_b64}}
+        else:
+            sign_doc = {
+                "data": tx_data,
+                "gas_limit": gas_limit,
+                "messages": execute_msgs,
+                "sender": self._addr,
+            }
+            sig_b64 = _sign_raw(_sha256(_canonical_json(sign_doc).encode()), self._pk)
+            signature = {"secp256k1": sig_b64}
+
         return {
             "sender": self._addr,
             "gas_limit": gas_limit,
-            "msgs": [{"execute": {"contract": self._contract, "funds": {}, "msg": msg}}],
-            "data": {
-                "chain_id": self._chain_id,
-                "expiry": None,
-                "nonce": nonce,
-                "user_index": user_index,
-            },
+            "msgs": execute_msgs,
+            "data": tx_data,
             "credential": {
                 "standard": {
                     "key_hash": self._key_hash,
-                    "signature": {"secp256k1": sig_b64},
+                    "signature": signature,
                 }
             },
         }
@@ -214,27 +321,42 @@ class DangoClient:
         return data.get("data", {}).get("broadcastTxSync", {})
 
     async def _broadcast(self, msg: dict) -> dict:
-        """트랜잭션 전송. user_index 불일치 시 자동 탐색 (최초 1회)."""
-        max_scan = 5  # 인덱스 0~4까지 시도
+        """트랜잭션 전송. user_index 불일치 + nonce 불일치 자동 보정."""
+        max_scan = 5   # user_index 스캔 범위
+        max_nonce_retries = 3
 
         for attempt in range(max_scan if not self._user_index_found else 1):
             idx = self._user_index + (attempt if not self._user_index_found else 0)
-            result = await self._broadcast_once(msg, idx)
-            err = self._parse_broadcast_error(result)
 
+            for nonce_try in range(max_nonce_retries):
+                result = await self._broadcast_once(msg, idx)
+                err = self._parse_broadcast_error(result)
+
+                if err is None:
+                    if not self._user_index_found:
+                        self._user_index = idx
+                        self._user_index_found = True
+                        logger.info("Dango user_index 확정: %d", idx)
+                    return result
+
+                if "nonce is too far ahead" in err:
+                    chain_nonce = self._extract_chain_nonce(err)
+                    if chain_nonce is not None and nonce_try < max_nonce_retries - 1:
+                        async with self._nonce_lock:
+                            self._nonce = chain_nonce
+                        logger.warning("Dango 논스 자동 보정: %d → 다음=%d", chain_nonce, chain_nonce + 1)
+                        continue
+
+                break  # 논스 이외 에러 또는 재시도 소진
+
+            err = self._parse_broadcast_error(result)
             if err is None:
-                # 성공
-                if not self._user_index_found:
-                    self._user_index = idx
-                    self._user_index_found = True
-                    logger.info("Dango user_index 확정: %d", idx)
                 return result
 
             if "isn't associated with user" in err and not self._user_index_found:
                 logger.warning("Dango user_index %d 불일치, 다음 시도...", idx)
                 continue
 
-            # 그 외 에러는 그냥 로그 남기고 반환
             logger.warning("Dango tx rejected (index=%d): %s", idx, err)
             return result
 
@@ -273,22 +395,42 @@ class DangoClient:
         result = data["data"]["queryApp"]
         return result["wasm_smart"] if result else None
 
-    async def _fetch_user_index(self) -> Optional[int]:
-        """ACCOUNT_FACTORY에서 이 주소의 실제 user_index 조회."""
-        logger.info("Dango user_index 조회 중 (address=%s)...", self._addr)
+    async def _load_key_info(self) -> None:
+        """ACCOUNT_FACTORY에서 user_index, key_hash, key_type 로드."""
+        env_val = os.environ.get("DANGO_USER_INDEX", "")
+        if not (env_val and env_val.isdigit() and int(env_val) > 0):
+            logger.warning("DANGO_USER_INDEX 미설정 — .env에 설정 필요")
+            return
+
+        user_idx = int(env_val)
+        self._user_index = user_idx
+        logger.info("Dango user_index: %d", user_idx)
+
         try:
             result = await self._query_app(
-                {"user": {"address": self._addr}},
+                {"user": {"index": user_idx}},
                 contract=self._ACCOUNT_FACTORY,
             )
-            if result and "index" in result:
-                idx = int(result["index"])
-                logger.info("Dango user_index 확정: %d", idx)
-                return idx
-            logger.warning("ACCOUNT_FACTORY 응답에 index 없음: %s", result)
+            keys: dict = (result or {}).get("keys", {})
+            if not keys:
+                raise ValueError("factory 응답에 keys 없음")
+
+            key_hash = next(iter(keys.keys()))
+            key_info = next(iter(keys.values()))
+            key_type = next(iter(key_info.keys()))  # "ethereum" | "secp256k1"
+
+            self._key_hash = key_hash
+            self._key_type = key_type
+            self._user_index_found = True
+            logger.info("Dango 키 로드: hash=%s type=%s", key_hash[:16] + "...", key_type)
         except Exception as e:
-            logger.warning("user_index 조회 실패: %s", e)
-        return None
+            logger.warning("factory 키 조회 실패 (%s) — 로컬 계산으로 폴백", e)
+            # 로컬 폴백: private key에서 직접 계산
+            self._key_hash = _derive_key_hash_ethereum(self._pk)
+            self._key_type = "ethereum"
+            self._user_index_found = True
+            logger.info("Dango 키 로컬 계산: hash=%s type=%s",
+                        self._key_hash[:16] + "...", self._key_type)
 
     async def _query_pair_stats(self, pair_id: str) -> dict:
         query = """
@@ -582,15 +724,9 @@ class DangoClient:
                 retry_delay = min(retry_delay * 2, 60)
 
     async def start(self):
-        """WebSocket 이벤트 구독 시작 + user_index 자동 확정"""
+        """WebSocket 이벤트 구독 시작 + key_hash/type/user_index 확정"""
         self._running = True
-        # 봇 시작 시 ACCOUNT_FACTORY에서 실제 user_index 조회
-        idx = await self._fetch_user_index()
-        if idx is not None:
-            self._user_index = idx
-            self._user_index_found = True
-        else:
-            logger.warning("user_index 자동 조회 실패 — .env DANGO_USER_INDEX=%d 로 폴백", self._user_index)
+        await self._load_key_info()
         self._ws_task = asyncio.create_task(self._ws_loop())
 
     async def stop(self):

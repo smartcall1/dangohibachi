@@ -10,14 +10,21 @@ import time
 _LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 os.makedirs(_LOG_DIR, exist_ok=True)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler(os.path.join(_LOG_DIR, "engine.log"), encoding="utf-8"),
-    ],
+_fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
+_console = logging.StreamHandler(sys.stdout)
+_console.setFormatter(_fmt)
+
+from logging.handlers import RotatingFileHandler
+_file = RotatingFileHandler(
+    os.path.join(_LOG_DIR, "engine.log"),
+    maxBytes=5 * 1024 * 1024,  # 5MB
+    backupCount=5,
+    encoding="utf-8",
 )
+_file.setFormatter(_fmt)
+
+logging.basicConfig(level=logging.INFO, handlers=[_console, _file])
 logger = logging.getLogger("main")
 
 RESTART_DELAY = 5
