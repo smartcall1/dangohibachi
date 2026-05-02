@@ -447,6 +447,12 @@ class Engine:
         pos = self.bot_state.position
         logger.info("EXIT 시작: %s %s reason=%s", pos.pair, pos.direction.value, pos.exit_reason)
 
+        # 진입 과정에서 남은 미취소 주문 전부 정리
+        try:
+            await self._dango.cancel_all_orders(Config.DANGO_SYMBOL_MAP[pos.pair])
+        except Exception:
+            pass
+
         total_to_exit = pos.dango_size
         per_chunk = total_to_exit / Config.EXIT_CHUNKS if total_to_exit > 0 else 0
         exited = 0.0
@@ -625,12 +631,12 @@ class Engine:
 
             fill_event = await self._dango.wait_for_fill(cid, timeout=Config.MAKER_FILL_TIMEOUT_SECONDS)
 
-            # 항상 cancel — 잔여 maker 정리 (이미 풀체결이면 무시됨)
+            # cancel_all — 잔여 maker 전부 정리 (cid 단건 취소는 deliver_tx 실패로 누락 위험)
             try:
-                await self._dango.cancel_order_by_client_id(dango_sym, cid)
-            except Exception:
-                pass
-            await asyncio.sleep(2)  # cancel 전파 + 후속 부분 체결 캡처
+                await self._dango.cancel_all_orders(dango_sym)
+            except Exception as e:
+                logger.warning("Dango cancel_all 실패: %s", e)
+            await asyncio.sleep(2)
 
             try:
                 size_after = await self._dango.get_position_signed_size(dango_sym)
@@ -771,9 +777,9 @@ class Engine:
             fill_event = await self._dango.wait_for_fill(cid, timeout=Config.MAKER_FILL_TIMEOUT_SECONDS)
 
             try:
-                await self._dango.cancel_order_by_client_id(dango_sym, cid)
-            except Exception:
-                pass
+                await self._dango.cancel_all_orders(dango_sym)
+            except Exception as e:
+                logger.warning("EXIT cancel_all 실패: %s", e)
             await asyncio.sleep(2)
 
             try:
