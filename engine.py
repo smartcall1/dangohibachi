@@ -59,6 +59,7 @@ class Engine:
         asyncio.create_task(self._health_monitor.run())
         self._register_telegram_callbacks()
         logger.info("엔진 시작")
+        await self._recovery_check()
 
         while not self._stop_requested:
             try:
@@ -330,6 +331,7 @@ class Engine:
         pos = self.bot_state.position
         logger.info("ENTER 시작: %s %s", pos.pair, pos.direction.value)
 
+        consecutive_failures = 0
         for chunk_idx in range(1, Config.ENTRY_CHUNKS + 1):
             success = await self._xemm_chunk(
                 pos=pos,
@@ -337,10 +339,14 @@ class Engine:
                 total_chunks=Config.ENTRY_CHUNKS,
                 reduce_only=False,
             )
-            if not success:
-                logger.error("ENTER 청크 %d 실패 — 진입 취소, COOLDOWN", chunk_idx)
-                # 부분 진입 시 그대로 진행 (pos.dango_size > 0이면 HOLD)
-                break
+            if success:
+                consecutive_failures = 0
+            else:
+                consecutive_failures += 1
+                if consecutive_failures >= 3:
+                    logger.error("ENTER 청크 %d — 3회 연속 실패, 진입 중단", chunk_idx)
+                    break
+                logger.warning("ENTER 청크 %d 실패 — %d/3 허용, 다음 청크 시도", chunk_idx, consecutive_failures)
 
         # 진입 완료 후 실측 재동기화 — 양쪽 실제 포지션을 봇 상태에 반영
         # (nado_grvt acba425 패턴 — bot 내부 상태와 거래소 실측 불일치 방지)
@@ -651,9 +657,16 @@ class Engine:
                     hibachi_sym, pos.hibachi_side, hb_taker_price,
                     actual_filled, post_only=False,
                 )
-                await asyncio.sleep(1)
-                hb_size_after = await self._hb.get_position_signed_size(hibachi_sym)
-                hb_filled = max(0.0, (hb_size_after - hb_size_before) * h_sign)
+                # Hibachi 포지션 반영 대기 — 1초는 부족 (delta_donemoji 8초 기준)
+                # 3초 대기 + 2회 폴링 재시도로 안정적 확인
+                hb_filled = 0.0
+                for poll in range(3):
+                    await asyncio.sleep(3)
+                    hb_size_after = await self._hb.get_position_signed_size(hibachi_sym)
+                    hb_filled = max(0.0, (hb_size_after - hb_size_before) * h_sign)
+                    if hb_filled >= actual_filled * 0.9:
+                        break
+                    logger.debug("Hibachi 폴링 %d/3: filled=%.6f/%.6f", poll + 1, hb_filled, actual_filled)
                 if hb_filled < actual_filled * 0.9:
                     raise RuntimeError(
                         f"Hibachi 헷지 부족: {hb_filled:.6f}/{actual_filled:.6f}"
@@ -788,9 +801,14 @@ class Engine:
                     hibachi_sym, hibachi_close_side, hb_taker_price,
                     actual_filled, post_only=False,
                 )
-                await asyncio.sleep(1)
-                hb_size_after = await self._hb.get_position_signed_size(hibachi_sym)
-                hb_closed = max(0.0, (hb_size_after - hb_size_before) * h_close_sign)
+                hb_closed = 0.0
+                for poll in range(3):
+                    await asyncio.sleep(3)
+                    hb_size_after = await self._hb.get_position_signed_size(hibachi_sym)
+                    hb_closed = max(0.0, (hb_size_after - hb_size_before) * h_close_sign)
+                    if hb_closed >= actual_filled * 0.9:
+                        break
+                    logger.debug("EXIT Hibachi 폴링 %d/3: closed=%.6f/%.6f", poll + 1, hb_closed, actual_filled)
                 if hb_closed < actual_filled * 0.9:
                     raise RuntimeError(
                         f"Hibachi EXIT 부족: {hb_closed:.6f}/{actual_filled:.6f}"
@@ -858,6 +876,89 @@ class Engine:
         if self.bot_state.state == State.HOLD_SUSPENDED:
             self.bot_state.suspended_since = None
             self._transition(State.HOLD)
+
+    # ──────────────────────────────────────────────
+    # 크래시 복구
+    # ──────────────────────────────────────────────
+
+    async def _recovery_check(self):
+        """봇 재시작 시 기존 포지션 복구 — 양쪽 거래소 실측 기반."""
+        for pair in Config.PAIRS:
+            dango_sym = Config.DANGO_SYMBOL_MAP[pair]
+            hibachi_sym = Config.HIBACHI_SYMBOL_MAP[pair]
+
+            try:
+                d_size = await self._dango.get_position_signed_size(dango_sym)
+                h_size = await self._hb.get_position_signed_size(hibachi_sym)
+            except Exception as e:
+                logger.warning("Recovery: 포지션 조회 실패 (%s): %s", pair, e)
+                continue
+
+            try:
+                mark = await self._dango.get_mark_price(dango_sym)
+            except Exception:
+                mark = 0
+
+            d_notional = abs(d_size) * mark
+            h_notional = abs(h_size) * mark
+
+            if d_notional < Config.DUST_NOTIONAL_USD and h_notional < Config.DUST_NOTIONAL_USD:
+                continue
+
+            if d_notional >= Config.DUST_NOTIONAL_USD and h_notional >= Config.DUST_NOTIONAL_USD:
+                # 양쪽 같은 방향이면 delta neutral 아님 — 수동 확인
+                if (d_size > 0 and h_size > 0) or (d_size < 0 and h_size < 0):
+                    logger.critical(
+                        "Recovery: 양쪽 같은 방향! dango=%.6f hibachi=%.6f",
+                        d_size, h_size,
+                    )
+                    await self._tg.send_alert(
+                        f"🚨 [RECOVERY] {pair} 양쪽 동일 방향 — 수동 확인 필요\n"
+                        f"Dango: {d_size:.6f} / Hibachi: {h_size:.6f}"
+                    )
+                    continue
+
+                direction = Direction.A if d_size > 0 else Direction.B
+                try:
+                    bal = await self._dango.get_balance()
+                    equity = bal["equity"]
+                except Exception:
+                    equity = 0
+
+                pos = Position(
+                    pair=pair,
+                    direction=direction,
+                    entry_balance=equity,
+                    target_notional=d_notional,
+                    dango_size=abs(d_size),
+                    hibachi_size=abs(h_size),
+                    avg_entry_price=mark,
+                    chunks_filled=0,
+                    entry_time=time.time(),
+                )
+                self.bot_state.position = pos
+                self._transition(State.HOLD)
+                logger.info(
+                    "Recovery: %s 포지션 복구 → HOLD (dango=%.6f hibachi=%.6f)",
+                    pair, abs(d_size), abs(h_size),
+                )
+                await self._tg.send_alert(
+                    f"🔁 [RECOVERY] {pair} 포지션 복구 → HOLD\n"
+                    f"Dango: {abs(d_size):.6f} ({direction.value})\n"
+                    f"Hibachi: {abs(h_size):.6f}\n"
+                    f"Mark: ${mark:,.2f}"
+                )
+                return
+
+            side = "Dango" if d_notional >= Config.DUST_NOTIONAL_USD else "Hibachi"
+            logger.warning("Recovery: %s 편측 포지션 감지 (%s)", pair, side)
+            await self._tg.send_alert(
+                f"⚠️ [RECOVERY] {pair} {side}에만 포지션 존재!\n"
+                f"Dango: {d_size:.6f} / Hibachi: {h_size:.6f}\n"
+                f"수동 확인 필요"
+            )
+
+        logger.info("Recovery: 포지션 없음 — IDLE 유지")
 
     # ──────────────────────────────────────────────
     # 유틸리티

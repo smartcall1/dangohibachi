@@ -126,9 +126,12 @@ class HibachiClient:
         for p in positions:
             if p.get("symbol") != symbol:
                 continue
-            qty = abs(float(p.get("quantity", p.get("size", 0)) or 0))
+            qty = abs(float(p.get("quantity", p.get("size", p.get("position_size", 0))) or 0))
             side = (p.get("side") or p.get("direction") or "").upper()
+            logger.debug("Hibachi position match: symbol=%s qty=%.6f side=%s raw=%s",
+                         symbol, qty, side, {k: p.get(k) for k in ("symbol", "quantity", "size", "side", "direction")})
             return qty if side in ("BUY", "LONG") else -qty
+        logger.debug("Hibachi position not found for %s (positions=%d)", symbol, len(positions))
         return 0.0
 
     async def get_mark_price(self, symbol: str) -> float:
