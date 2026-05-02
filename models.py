@@ -45,6 +45,7 @@ class Position:
     chunks_filled: int = 0
     entry_time: float = field(default_factory=time.time)
     fills: list[ChunkFill] = field(default_factory=list)
+    exit_reason: str = ""        # EXIT 트리거 사유 (Status UI / Cycle 기록용)
 
     @property
     def dango_symbol(self) -> str:
