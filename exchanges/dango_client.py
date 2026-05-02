@@ -187,8 +187,10 @@ class DangoClient:
             raise RuntimeError(err_msg)
         
         result = data.get("data", {}).get("broadcastTxSync", {})
+        logger.info("Dango broadcast result: %s", json.dumps(result))
+        
         if result and result.get("code") != 0:
-            logger.warning("Dango tx rejected: code=%s, log=%s", result.get("code"), result.get("log"))
+            logger.warning("Dango tx rejected: %s", json.dumps(result))
         
         return result
 
