@@ -525,8 +525,8 @@ class Engine:
         # 진입 과정에서 남은 미취소 주문 전부 정리
         try:
             await self._dango.cancel_all_orders(Config.DANGO_SYMBOL_MAP[pos.pair])
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("EXIT 시작 cancel_all 실패: %s", e)
 
         total_to_exit = pos.dango_size
         per_chunk = total_to_exit / Config.EXIT_CHUNKS if total_to_exit > 0 else 0
@@ -706,11 +706,16 @@ class Engine:
 
             fill_event = await self._dango.wait_for_fill(cid, timeout=Config.MAKER_FILL_TIMEOUT_SECONDS)
 
-            # cancel_all — 잔여 maker 전부 정리 (cid 단건 취소는 deliver_tx 실패로 누락 위험)
+            # cancel_all — 잔여 maker 전부 정리 (deliver_tx 검증 포함)
+            cancel_ok = False
             try:
-                await self._dango.cancel_all_orders(dango_sym)
+                result = await self._dango.cancel_all_orders(dango_sym)
+                cancel_ok = bool(result)
             except Exception as e:
                 logger.warning("Dango cancel_all 실패: %s", e)
+            if not cancel_ok:
+                logger.error("cancel_all 실패 — 잔여 주문 존재 위험, 청크 중단")
+                return False
             await asyncio.sleep(2)
 
             try:
@@ -848,10 +853,15 @@ class Engine:
 
             await self._dango.wait_for_fill(cid, timeout=Config.MAKER_FILL_TIMEOUT_SECONDS)
 
+            cancel_ok = False
             try:
-                await self._dango.cancel_all_orders(dango_sym)
-            except Exception:
-                pass
+                result = await self._dango.cancel_all_orders(dango_sym)
+                cancel_ok = bool(result)
+            except Exception as e:
+                logger.warning("EXIT cancel_all 실패: %s", e)
+            if not cancel_ok:
+                logger.error("EXIT cancel_all 실패 — 잔여 주문 위험, 청크 중단")
+                return False
             await asyncio.sleep(2)
 
             try:

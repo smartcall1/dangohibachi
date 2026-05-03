@@ -675,13 +675,29 @@ class DangoClient:
             return {}
 
     async def cancel_all_orders(self, pair_id: str) -> dict:
-        """페어 전체 주문 취소"""
+        """페어 전체 주문 취소 — deliver_tx 검증 + 재시도"""
         msg = {"trade": {"cancel_order": {"pair_id": pair_id, "order_id": "all"}}}
-        try:
-            return await self._broadcast(msg) or {}
-        except Exception as e:
-            logger.warning("Dango cancel_all error: %s", e)
-            return {}
+        for attempt in range(3):
+            try:
+                result = await self._broadcast(msg)
+                err = self._parse_broadcast_error(result)
+                if err:
+                    logger.warning("cancel_all check_tx 실패 (%d/3): %s", attempt + 1, err)
+                    await asyncio.sleep(1)
+                    continue
+                tx_hash = (result or {}).get("tx_hash", "?")
+                deliver_err = await self._verify_tx_committed(tx_hash)
+                if deliver_err:
+                    logger.warning("cancel_all deliver_tx 실패 (%d/3): %s", attempt + 1, deliver_err)
+                    await asyncio.sleep(1)
+                    continue
+                logger.info("Dango cancel_all OK: pair=%s tx=%s", pair_id, tx_hash[:16])
+                return result or {}
+            except Exception as e:
+                logger.warning("cancel_all error (%d/3): %s", attempt + 1, e)
+                await asyncio.sleep(1)
+        logger.error("Dango cancel_all 3회 실패: pair=%s — 잔여 주문 존재 가능!", pair_id)
+        return {}
 
     async def place_market_order(
         self, pair_id: str, side: str, size: float, slippage: float = 0.05
