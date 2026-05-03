@@ -37,8 +37,9 @@ class ChunkFill:
 class Position:
     pair: str                    # "ETH" or "BTC"
     direction: Direction
-    entry_balance: float         # 진입 시 잔고 (원금 회수 기준)
+    entry_balance: float         # 진입 시 Dango 잔고 (원금 회수 기준)
     target_notional: float       # 목표 명목 포지션 크기 (USD)
+    entry_total_balance: float = 0.0  # 진입 시 양쪽 합산 잔고 (Status PnL 표시용)
     dango_size: float = 0.0      # 실제 체결된 Dango 포지션 크기
     hibachi_size: float = 0.0    # 실제 체결된 Hibachi 포지션 크기
     avg_entry_price: float = 0.0
@@ -112,6 +113,7 @@ class BotState:
                 "pair": p.pair,
                 "direction": p.direction.value,
                 "entry_balance": p.entry_balance,
+                "entry_total_balance": p.entry_total_balance,
                 "target_notional": p.target_notional,
                 "dango_size": p.dango_size,
                 "hibachi_size": p.hibachi_size,

@@ -125,16 +125,17 @@ class Engine:
 
         total = d_equity + h_equity
         if pos:
-            pnl = total - pos.entry_balance if pos.entry_balance > 0 else 0
-            pct = pnl / pos.entry_balance * 100 if pos.entry_balance > 0 else 0
+            entry_total = pos.entry_total_balance if pos.entry_total_balance > 0 else pos.entry_balance
+            pnl = total - entry_total if entry_total > 0 else 0
+            pct = pnl / entry_total * 100 if entry_total > 0 else 0
             emoji = "🟢" if pnl >= 0 else "🔴"
             lines.append(f"💰 <b>${total:,.0f}</b> {emoji} <b>${pnl:+,.2f}</b> ({pct:+.2f}%)")
             lines.append(f"   (D ${d_equity:,.2f} / H ${h_equity:,.2f})")
-            lines.append(f"   진입 ${pos.entry_balance:,.0f}")
+            lines.append(f"   진입 ${entry_total:,.0f}")
 
-            # 익절 트리거
+            # 익절 트리거 (Dango 잔고 기준 — should_exit 로직과 동일)
             required = pos.entry_balance + pos.target_notional * Config.ROUND_TRIP_FEE_RATE + Config.PRINCIPAL_BUFFER_USD
-            gap = required - total
+            gap = required - d_equity
             if gap <= 0:
                 lines.append("   🎯 원금회수 청산 임박!")
             else:
@@ -379,10 +380,17 @@ class Engine:
             await asyncio.sleep(5)
             return
 
+        try:
+            h_bal = await self._hb.get_balance()
+            h_equity = float(h_bal.get("balance", h_bal.get("equity", 0)) or 0)
+        except Exception:
+            h_equity = 0
+
         self.bot_state.position = Position(
             pair=pair,
             direction=direction,
             entry_balance=equity,
+            entry_total_balance=equity + h_equity,
             target_notional=notional,
             avg_entry_price=price,
         )
@@ -1035,16 +1043,22 @@ class Engine:
                     equity = bal["equity"]
                 except Exception:
                     equity = 0
+                try:
+                    h_bal = await self._hb.get_balance()
+                    h_equity = float(h_bal.get("balance", h_bal.get("equity", 0)) or 0)
+                except Exception:
+                    h_equity = 0
 
                 pos = Position(
                     pair=pair,
                     direction=direction,
                     entry_balance=equity,
+                    entry_total_balance=equity + h_equity,
                     target_notional=d_notional,
                     dango_size=abs(d_size),
                     hibachi_size=abs(h_size),
                     avg_entry_price=mark,
-                    chunks_filled=0,
+                    chunks_filled=Config.ENTRY_CHUNKS,
                     entry_time=time.time(),
                 )
                 self.bot_state.position = pos
