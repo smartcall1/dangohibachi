@@ -568,6 +568,7 @@ class Engine:
             logger.warning("EXIT 시작 cancel_all 실패: %s", e)
 
         dango_sym = Config.DANGO_SYMBOL_MAP[pos.pair]
+        hibachi_sym = Config.HIBACHI_SYMBOL_MAP[pos.pair]
         try:
             actual_pos = await self._dango.get_position_signed_size(dango_sym)
             total_to_exit = abs(actual_pos)
@@ -602,8 +603,22 @@ class Engine:
             )
             if success:
                 exited += chunk_size
+                self.bot_state.exit_failure_count = 0
             else:
                 self.bot_state.exit_failure_count += 1
+                # Hibachi 잔여분 불균형이면 다음 Dango 청크 전에 Hibachi만 재시도
+                imbalance = abs(pos.dango_size - pos.hibachi_size)
+                if imbalance > 1e-6:
+                    logger.warning(
+                        "EXIT 헷지 불균형 (dango=%.6f hibachi=%.6f) → Hibachi 재매칭 시도",
+                        pos.dango_size, pos.hibachi_size,
+                    )
+                    await asyncio.sleep(10)
+                    matched = await self._retry_hibachi_match(pos, imbalance)
+                    if matched:
+                        logger.info("Hibachi 재매칭 성공 — EXIT 계속")
+                        self.bot_state.exit_failure_count = 0
+                        continue
                 if self.bot_state.exit_failure_count >= Config.MAX_EXIT_FAILURES:
                     self._transition(State.MANUAL_INTERVENTION)
                     return
@@ -959,7 +974,15 @@ class Engine:
 
         # ── Phase 3: Hibachi taker 청산 (2회 시도 — 실패 시 넓은 슬리피지 재시도) ──
         hb_closed_total = 0.0
-        hb_size_origin = await self._hb.get_position_signed_size(hibachi_sym)
+        try:
+            hb_size_origin = await self._hb.get_position_signed_size(hibachi_sym)
+        except Exception as e:
+            logger.error("EXIT Hibachi 포지션 조회 실패 (Dango %.6f 이미 청산됨): %s", actual_filled, e)
+            pos.dango_size = max(0.0, pos.dango_size - actual_filled)
+            await self._tg.send_alert(
+                f"[🚨 EXIT 불균형] Hibachi API 장애! Dango {actual_filled:.6f} 청산됨 — 즉시 확인!"
+            )
+            return False
         hb_slippages = [0.005, 0.015]
         for hb_attempt, slip_pct in enumerate(hb_slippages, 1):
             hb_remaining = actual_filled - hb_closed_total
@@ -1008,6 +1031,34 @@ class Engine:
             chunk_idx, total_chunks, actual_filled, hb_closed_total, fill_price,
         )
         return True
+
+    async def _retry_hibachi_match(self, pos: Position, deficit: float) -> bool:
+        """Hibachi 청산 부족분 재매칭. Dango는 이미 청산됨, Hibachi만 추가 청산."""
+        hibachi_sym = Config.HIBACHI_SYMBOL_MAP[pos.pair]
+        close_side = "BUY" if pos.hibachi_side == "SELL" else "SELL"
+        try:
+            mark = await self._hb.get_mark_price(hibachi_sym)
+            hb_tick = Config.HIBACHI_TICK_SIZE.get(pos.pair, 0.01)
+            slip = 1.015 if close_side == "BUY" else 0.985
+            price = _quantize_to_tick(mark * slip, hb_tick)
+            hb_before = await self._hb.get_position_signed_size(hibachi_sym)
+            await self._hb.place_limit_order(
+                hibachi_sym, close_side, price, deficit, post_only=False,
+            )
+            h_sign = 1.0 if close_side == "BUY" else -1.0
+            for _ in range(4):
+                await asyncio.sleep(3)
+                hb_after = await self._hb.get_position_signed_size(hibachi_sym)
+                closed = max(0.0, (hb_after - hb_before) * h_sign)
+                if closed >= deficit * 0.8:
+                    pos.hibachi_size = max(0.0, pos.hibachi_size - closed)
+                    logger.info("Hibachi 재매칭 완료: %.6f/%.6f", closed, deficit)
+                    return True
+            logger.warning("Hibachi 재매칭 부족: deficit=%.6f", deficit)
+            return False
+        except Exception as e:
+            logger.error("Hibachi 재매칭 실패: %s", e)
+            return False
 
     # ──────────────────────────────────────────────
     # 긴급 Hibachi-only 청산
