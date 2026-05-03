@@ -957,35 +957,55 @@ class Engine:
             except Exception:
                 fill_price = pos.avg_entry_price
 
-        # ── Phase 3: Hibachi taker 청산 ──
-        try:
-            hb_size_before = await self._hb.get_position_signed_size(hibachi_sym)
-            slip = 1.005 if hibachi_close_side == "BUY" else 0.995
-            hb_tick = Config.HIBACHI_TICK_SIZE.get(pos.pair, 0.01)
-            hb_taker_price = _quantize_to_tick(fill_price * slip, hb_tick)
-            await self._hb.place_limit_order(
-                hibachi_sym, hibachi_close_side, hb_taker_price,
-                actual_filled, post_only=False,
-            )
-            hb_closed = 0.0
-            for poll in range(3):
-                await asyncio.sleep(3)
-                hb_size_after = await self._hb.get_position_signed_size(hibachi_sym)
-                hb_closed = max(0.0, (hb_size_after - hb_size_before) * h_close_sign)
-                if hb_closed >= actual_filled * 0.9:
+        # ── Phase 3: Hibachi taker 청산 (2회 시도 — 실패 시 넓은 슬리피지 재시도) ──
+        hb_closed_total = 0.0
+        hb_size_origin = await self._hb.get_position_signed_size(hibachi_sym)
+        hb_slippages = [0.005, 0.015]
+        for hb_attempt, slip_pct in enumerate(hb_slippages, 1):
+            hb_remaining = actual_filled - hb_closed_total
+            if hb_remaining < 1e-8:
+                break
+            try:
+                hb_size_before = await self._hb.get_position_signed_size(hibachi_sym)
+                slip = (1 + slip_pct) if hibachi_close_side == "BUY" else (1 - slip_pct)
+                hb_tick = Config.HIBACHI_TICK_SIZE.get(pos.pair, 0.01)
+                hb_taker_price = _quantize_to_tick(fill_price * slip, hb_tick)
+                await self._hb.place_limit_order(
+                    hibachi_sym, hibachi_close_side, hb_taker_price,
+                    hb_remaining, post_only=False,
+                )
+                for poll in range(3):
+                    await asyncio.sleep(3)
+                    hb_size_now = await self._hb.get_position_signed_size(hibachi_sym)
+                    hb_closed_total = max(0.0, (hb_size_now - hb_size_origin) * h_close_sign)
+                    if hb_closed_total >= actual_filled * 0.9:
+                        break
+                if hb_closed_total >= actual_filled * 0.9:
                     break
-                logger.debug("EXIT Hibachi 폴링 %d/3: closed=%.6f/%.6f", poll + 1, hb_closed, actual_filled)
-            if hb_closed < actual_filled * 0.9:
-                raise RuntimeError(f"Hibachi EXIT 부족: {hb_closed:.6f}/{actual_filled:.6f}")
-        except Exception as e:
-            logger.error("EXIT Hibachi 실패 — 청크 %d (Dango %.6f 청산됨): %s", chunk_idx, actual_filled, e)
-            return False
+                logger.warning(
+                    "EXIT Hibachi 시도 %d/%d 부족: %.6f/%.6f (slip=%.1f%%)",
+                    hb_attempt, len(hb_slippages), hb_closed_total, actual_filled, slip_pct * 100,
+                )
+            except Exception as e:
+                logger.warning("EXIT Hibachi 시도 %d/%d 실패: %s", hb_attempt, len(hb_slippages), e)
 
         pos.dango_size = max(0.0, pos.dango_size - actual_filled)
-        pos.hibachi_size = max(0.0, pos.hibachi_size - hb_closed)
+        pos.hibachi_size = max(0.0, pos.hibachi_size - hb_closed_total)
+
+        if hb_closed_total < actual_filled * 0.5:
+            logger.error(
+                "EXIT Hibachi 청산 심각 부족 — 청크 %d dango=%.6f hibachi=%.6f → 헷지 불균형!",
+                chunk_idx, actual_filled, hb_closed_total,
+            )
+            await self._tg.send_alert(
+                f"[🚨 EXIT 불균형] 청크 {chunk_idx}: Dango {actual_filled:.6f} 청산, "
+                f"Hibachi {hb_closed_total:.6f}만 청산 — 확인 필요!"
+            )
+            return False
+
         logger.info(
             "EXIT 청크 %d/%d: dango=%.6f hibachi=%.6f @ %.2f",
-            chunk_idx, total_chunks, actual_filled, hb_closed, fill_price,
+            chunk_idx, total_chunks, actual_filled, hb_closed_total, fill_price,
         )
         return True
 
