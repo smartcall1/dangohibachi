@@ -491,6 +491,8 @@ class Engine:
             await self._tg.notify_enter(
                 pos.pair, pos.direction.value, pos.target_notional,
                 pos.avg_entry_price, self.bot_state.cycle_count + 1,
+                chunks=pos.chunks_filled, total_chunks=Config.ENTRY_CHUNKS,
+                dango_size=pos.dango_size, hibachi_size=pos.hibachi_size,
             )
             self._transition(State.HOLD)
         else:
@@ -642,8 +644,11 @@ class Engine:
         await self._finalize_cycle(pos)
 
     async def _finalize_cycle(self, pos: Position, reason_override: Optional[str] = None):
-        """사이클 정상 종료 — Cycle 기록 + 텔레그램 알림 + COOLDOWN 전환."""
+        """사이클 정상 종료 — dust 청산 + Cycle 기록 + 텔레그램 알림 + COOLDOWN 전환."""
         self.bot_state.exit_failure_count = 0
+
+        await self._close_dust(pos)
+
         bal = await self._safe_get_balance()
         pnl = (bal - pos.entry_balance) if bal else 0.0
         self.bot_state.cycle_count += 1
@@ -661,10 +666,43 @@ class Engine:
             chunks=pos.chunks_filled,
         )
         self._save_cycle(cycle)
-        await self._tg.notify_exit(reason, pnl, self.bot_state.cycle_count)
+        await self._tg.notify_exit(
+            pair=pos.pair, direction=pos.direction.value,
+            reason=reason, pnl=pnl, cycle=self.bot_state.cycle_count,
+            entry_price=pos.avg_entry_price, chunks=pos.chunks_filled,
+            total_chunks=Config.ENTRY_CHUNKS, balance=bal or pos.entry_balance,
+        )
 
         self.bot_state.position = None
         self._transition(State.COOLDOWN)
+
+    async def _close_dust(self, pos: Position):
+        """양쪽 거래소 잔여 dust 포지션을 시장가로 정리."""
+        dango_sym = Config.DANGO_SYMBOL_MAP[pos.pair]
+        hibachi_sym = Config.HIBACHI_SYMBOL_MAP[pos.pair]
+
+        for name, sym in [("Dango", dango_sym), ("Hibachi", hibachi_sym)]:
+            try:
+                client = self._dango if name == "Dango" else self._hb
+                remaining = await client.get_position_signed_size(sym)
+                if abs(remaining) < 1e-8:
+                    continue
+                close_side = "SELL" if remaining > 0 else "BUY"
+                qty = abs(remaining)
+                if name == "Dango":
+                    await self._dango.place_market_order(
+                        sym, close_side, qty,
+                        slippage=Config.EMERGENCY_CLOSE_SLIPPAGE_PCT,
+                    )
+                else:
+                    open_side = "BUY" if remaining > 0 else "SELL"
+                    await self._hb.close_position(
+                        sym, open_side, qty,
+                        slippage_pct=Config.EMERGENCY_CLOSE_SLIPPAGE_PCT,
+                    )
+                logger.info("Dust 청산: %s %s %.6f", name, close_side, qty)
+            except Exception as e:
+                logger.warning("Dust 청산 실패 (%s): %s", name, e)
 
     async def _positions_at_dust(self, pos: Position) -> bool:
         """양 거래소 실측 포지션의 합 notional이 DUST_NOTIONAL_USD 미만이면 True.
@@ -700,8 +738,25 @@ class Engine:
     async def _state_manual(self):
         now = time.time()
         if now - self.bot_state.last_manual_alert > 1800:
+            pos = self.bot_state.position
+            d_size = h_size = 0.0
+            d_notional = h_notional = 0.0
+            pair = pos.pair if pos else "?"
+            if pos:
+                try:
+                    d_size = await self._dango.get_position_signed_size(Config.DANGO_SYMBOL_MAP[pos.pair])
+                    h_size = await self._hb.get_position_signed_size(Config.HIBACHI_SYMBOL_MAP[pos.pair])
+                    mark = await self._dango.get_mark_price(Config.DANGO_SYMBOL_MAP[pos.pair])
+                    d_notional = abs(d_size) * mark
+                    h_notional = abs(h_size) * mark
+                except Exception:
+                    pass
             await self._tg.notify_manual_intervention(
-                self.bot_state.exit_failure_count, self.bot_state.cycle_count
+                failures=self.bot_state.exit_failure_count,
+                cycle=self.bot_state.cycle_count,
+                pair=pair,
+                dango_size=d_size, dango_notional=d_notional,
+                hibachi_size=h_size, hibachi_notional=h_notional,
             )
             self.bot_state.last_manual_alert = now
         await asyncio.sleep(60)

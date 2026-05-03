@@ -132,17 +132,29 @@ class TelegramUI:
     # 이벤트 알림 메서드 (engine에서 호출)
     # ──────────────────────────────────────────────
 
-    async def notify_enter(self, pair: str, direction: str, notional: float, price: float, cycle: int):
+    async def notify_enter(
+        self, pair: str, direction: str, notional: float,
+        price: float, cycle: int, chunks: int = 0, total_chunks: int = 0,
+        dango_size: float = 0.0, hibachi_size: float = 0.0,
+    ):
         await self.send_alert(
             f"✅ <b>[ENTER #{cycle}]</b> {pair} {direction}\n"
-            f"Notional: ${notional:,.0f} | 진입가: {price:.2f}"
+            f"Notional: ${notional:,.0f} | 진입가: {price:.2f}\n"
+            f"청크: {chunks}/{total_chunks}\n"
+            f"Dango: {dango_size:.6f} | Hibachi: {hibachi_size:.6f}"
         )
 
-    async def notify_exit(self, reason: str, pnl: float, cycle: int):
+    async def notify_exit(
+        self, pair: str, direction: str, reason: str,
+        pnl: float, cycle: int, entry_price: float = 0.0,
+        chunks: int = 0, total_chunks: int = 0, balance: float = 0.0,
+    ):
         emoji = "🟢" if pnl >= 0 else "🔴"
         await self.send_alert(
-            f"{emoji} <b>[EXIT #{cycle}]</b> {reason}\n"
-            f"PnL: ${pnl:+.2f}"
+            f"{emoji} <b>[EXIT #{cycle}]</b> {pair} {direction}\n"
+            f"사유: {reason}\n"
+            f"진입가: {entry_price:.2f} | 청크: {chunks}/{total_chunks}\n"
+            f"PnL: ${pnl:+.2f} | 잔고: ${balance:,.2f}"
         )
 
     async def notify_margin_warning(self, exchange: str, pct: float):
@@ -160,11 +172,18 @@ class TelegramUI:
             f"Dango 포지션 수동 청산 필요: size={size:.6f}"
         )
 
-    async def notify_manual_intervention(self, failures: int, cycle: int):
-        await self.send_alert(
-            f"🚨 <b>[MANUAL INTERVENTION]</b> EXIT 실패 {failures}회 — 수동 개입 필요\n"
-            f"사이클: #{cycle}"
-        )
+    async def notify_manual_intervention(
+        self, failures: int, cycle: int, pair: str = "?",
+        dango_size: float = 0.0, dango_notional: float = 0.0,
+        hibachi_size: float = 0.0, hibachi_notional: float = 0.0,
+    ):
+        lines = [
+            f"🚨 <b>[MANUAL]</b> {pair} | EXIT 실패 {failures}회 — 수동 개입 필요",
+            f"사이클: #{cycle}",
+            f"Dango:   {dango_size:+.6f} (${dango_notional:,.2f})",
+            f"Hibachi: {hibachi_size:+.6f} (${hibachi_notional:,.2f})",
+        ]
+        await self.send_alert("\n".join(lines))
 
     async def notify_chunk_filled(self, chunk_idx: int, total: int, price: float, size: float):
         await self.send_alert(
