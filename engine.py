@@ -414,23 +414,26 @@ class Engine:
         pos = self.bot_state.position
         logger.info("ENTER 시작: %s %s", pos.pair, pos.direction.value)
 
-        enter_deadline = time.time() + 30 * 60
+        enter_deadline = time.time() + 60 * 60
         chunk_idx = pos.chunks_filled + 1
+        concession_carry = 0.0
         while chunk_idx <= Config.ENTRY_CHUNKS:
             if time.time() > enter_deadline:
-                logger.warning("ENTER 30분 타임아웃 — %d/%d 청크로 진행", pos.chunks_filled, Config.ENTRY_CHUNKS)
+                logger.warning("ENTER 60분 타임아웃 — %d/%d 청크로 진행", pos.chunks_filled, Config.ENTRY_CHUNKS)
                 break
-            success = await self._xemm_chunk(
+            success, concession_carry = await self._xemm_chunk(
                 pos=pos,
                 chunk_idx=chunk_idx,
                 total_chunks=Config.ENTRY_CHUNKS,
                 reduce_only=False,
+                concession_carry=concession_carry,
             )
             if success:
+                concession_carry = 0.0
                 chunk_idx += 1
             else:
                 wait = min(30, 10 * (chunk_idx - pos.chunks_filled))
-                logger.info("ENTER 청크 %d 실패 — %d초 후 재시도", chunk_idx, wait)
+                logger.info("ENTER 청크 %d 실패 — %d초 후 재시도 (concession=%.4f)", chunk_idx, wait, concession_carry)
                 await asyncio.sleep(wait)
 
         # 진입 완료 후 실측 재동기화 — 양쪽 실제 포지션을 봇 상태에 반영
@@ -708,16 +711,12 @@ class Engine:
     # ──────────────────────────────────────────────
 
     async def _xemm_chunk(
-        self, pos: Position, chunk_idx: int, total_chunks: int, reduce_only: bool
-    ) -> bool:
+        self, pos: Position, chunk_idx: int, total_chunks: int, reduce_only: bool,
+        concession_carry: float = 0.0,
+    ) -> tuple[bool, float]:
         """
         1청크 진입: Dango maker → 실측 체결량으로 Hibachi taker 헷지.
-
-        안전 패턴 (Bug C 방지, P0+P1 적용):
-        1. 매 시도마다 포지션 사이즈 before/after 비교 → 실제 체결량 산정
-        2. 항상 cancel 후 잔량 정리 (race 방지)
-        3. Hibachi 헷지 부족 시 Dango 반대 방향으로 롤백
-        4. MAKER_RETRY_LIMIT 초과 시 종료 (무한 루프 방지)
+        Returns (성공 여부, 마지막 concession 값) — 실패 시 concession을 외부로 전달.
         """
         dango_sym = Config.DANGO_SYMBOL_MAP[pos.pair]
         hibachi_sym = Config.HIBACHI_SYMBOL_MAP[pos.pair]
@@ -726,12 +725,12 @@ class Engine:
         d_sign = 1.0 if pos.dango_side == "BUY" else -1.0
         h_sign = 1.0 if pos.hibachi_side == "BUY" else -1.0
 
-        concession = 0.0
+        concession = concession_carry
 
         for retry in range(Config.MAKER_RETRY_LIMIT):
             if self._health_monitor.is_down:
                 logger.warning("Dango 다운 — 청크 %d 중단", chunk_idx)
-                return False
+                return False, concession
 
             try:
                 bbo = await self._dango.get_bbo(dango_sym)
@@ -781,7 +780,7 @@ class Engine:
                 logger.warning("Dango cancel_all 실패: %s", e)
             if not cancel_ok:
                 logger.error("cancel_all 실패 — 잔여 주문 존재 위험, 청크 중단")
-                return False
+                return False, concession
             await asyncio.sleep(2)
 
             try:
@@ -793,8 +792,8 @@ class Engine:
             actual_filled = max(0.0, (size_after - size_before) * d_sign)
 
             if actual_filled < chunk_size * 0.01:
-                # 사실상 미체결 — 가격 양보 후 재시도 (hard cap이 cross 방지)
                 concession += max(Config.MAKER_PRICE_STEP_USD, tick)
+                concession = min(concession, spread * 0.5)
                 continue
 
             fill_price = float(fill_event.get("fill_price", price)) if fill_event else price
@@ -836,7 +835,7 @@ class Engine:
                         "Dango 롤백 실패! 수동 개입 필요 (size=%.6f side=%s): %s",
                         actual_filled, rollback_side, re,
                     )
-                return False
+                return False, concession
 
             # 성공 — 체결량 동기화 (일치 보장된 값 사용)
             matched = min(actual_filled, hb_filled)
@@ -847,17 +846,17 @@ class Engine:
                 (pos.avg_entry_price * (chunk_idx - 1) + fill_price) / chunk_idx
             )
             logger.info(
-                "청크 %d/%d 완료: matched=%.6f (dango=%.6f hibachi=%.6f) @ %.2f retries=%d",
+                "청크 %d/%d 완료: matched=%.6f (dango=%.6f hibachi=%.6f) @ %.2f retries=%d concession=%.4f",
                 chunk_idx, total_chunks, matched, actual_filled, hb_filled,
-                fill_price, retry,
+                fill_price, retry, concession,
             )
-            return True
+            return True, 0.0
 
         logger.warning(
-            "청크 %d MAKER_RETRY_LIMIT(%d) 소진 — 미체결",
-            chunk_idx, Config.MAKER_RETRY_LIMIT,
+            "청크 %d MAKER_RETRY_LIMIT(%d) 소진 — 미체결 (concession=%.4f)",
+            chunk_idx, Config.MAKER_RETRY_LIMIT, concession,
         )
-        return False
+        return False, concession
 
     # ──────────────────────────────────────────────
     # 청산 청크 실행 (maker 5회 → 시장가 fallback)

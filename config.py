@@ -73,8 +73,7 @@ class Config:
     PRINCIPAL_BUFFER_USD: float = float(os.getenv("PRINCIPAL_BUFFER_USD", "10"))
 
     # XEMM 실행
-    # Dango 얇은 책 — 체결되면 수초, 안 되면 영영 안 됨. 길게 잡을 의미 없음.
-    MAKER_FILL_TIMEOUT_SECONDS: int = int(os.getenv("MAKER_FILL_TIMEOUT_SECONDS", "15"))
+    MAKER_FILL_TIMEOUT_SECONDS: int = int(os.getenv("MAKER_FILL_TIMEOUT_SECONDS", "30"))
     MAKER_PRICE_STEP_USD: float = float(os.getenv("MAKER_PRICE_STEP_USD", "0.01"))
     # 청크당 maker 재시도 한도 — 무한 루프 방지 (delta_donemoji XEMM 패턴)
     MAKER_RETRY_LIMIT: int = int(os.getenv("MAKER_RETRY_LIMIT", "5"))
