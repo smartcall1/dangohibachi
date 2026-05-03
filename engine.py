@@ -414,8 +414,12 @@ class Engine:
         pos = self.bot_state.position
         logger.info("ENTER 시작: %s %s", pos.pair, pos.direction.value)
 
-        consecutive_failures = 0
-        for chunk_idx in range(1, Config.ENTRY_CHUNKS + 1):
+        enter_deadline = time.time() + 30 * 60
+        chunk_idx = pos.chunks_filled + 1
+        while chunk_idx <= Config.ENTRY_CHUNKS:
+            if time.time() > enter_deadline:
+                logger.warning("ENTER 30분 타임아웃 — %d/%d 청크로 진행", pos.chunks_filled, Config.ENTRY_CHUNKS)
+                break
             success = await self._xemm_chunk(
                 pos=pos,
                 chunk_idx=chunk_idx,
@@ -423,13 +427,11 @@ class Engine:
                 reduce_only=False,
             )
             if success:
-                consecutive_failures = 0
+                chunk_idx += 1
             else:
-                consecutive_failures += 1
-                if consecutive_failures >= 3:
-                    logger.error("ENTER 청크 %d — 3회 연속 실패, 진입 중단", chunk_idx)
-                    break
-                logger.warning("ENTER 청크 %d 실패 — %d/3 허용, 다음 청크 시도", chunk_idx, consecutive_failures)
+                wait = min(30, 10 * (chunk_idx - pos.chunks_filled))
+                logger.info("ENTER 청크 %d 실패 — %d초 후 재시도", chunk_idx, wait)
+                await asyncio.sleep(wait)
 
         # 진입 완료 후 실측 재동기화 — 양쪽 실제 포지션을 봇 상태에 반영
         # (nado_grvt acba425 패턴 — bot 내부 상태와 거래소 실측 불일치 방지)
