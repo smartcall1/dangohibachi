@@ -710,10 +710,7 @@ class DangoClient:
         """client_order_id로 주문 취소"""
         msg = {
             "trade": {
-                "cancel_order": {
-                    "pair_id": pair_id,
-                    "order_id": {"one_by_client_order_id": client_order_id},
-                }
+                "cancel_order": {"one_by_client_order_id": client_order_id},
             }
         }
         try:
@@ -727,7 +724,7 @@ class DangoClient:
     async def cancel_all_orders(self, pair_id: str) -> dict:
         """페어 전체 주문 취소 — deliver_tx 검증 + 재시도.
         취소할 주문이 없어도 성공으로 간주."""
-        msg = {"trade": {"cancel_order": {"pair_id": pair_id, "order_id": "all"}}}
+        msg = {"trade": {"cancel_order": "all"}}
         for attempt in range(3):
             try:
                 result = await self._broadcast(msg)
