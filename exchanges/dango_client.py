@@ -154,8 +154,8 @@ class DangoClient:
         self._key_hash: str = ""
         self._key_type: str = "secp256k1"  # "secp256k1" | "ethereum"
 
-        # Dango nonce는 순차 증분 — 계정 최초 논스 4부터 시작, 재시작 시 에러 자동 보정
-        self._nonce: int = 4
+        self._nonce_file = os.path.join(os.path.dirname(__file__), "..", "logs", "nonce.dat")
+        self._nonce: int = self._load_nonce()
         self._nonce_lock = asyncio.Lock()
 
         # Dango 계정 인덱스 (첫 주문 시 자동 탐색)
@@ -173,6 +173,23 @@ class DangoClient:
     # ──────────────────────────────────────────────
     # 논스 관리
     # ──────────────────────────────────────────────
+
+    def _load_nonce(self) -> int:
+        try:
+            with open(self._nonce_file) as f:
+                val = int(f.read().strip())
+                logger.info("Nonce 복원: %d (from %s)", val, self._nonce_file)
+                return val
+        except Exception:
+            return 4
+
+    def _save_nonce(self):
+        try:
+            os.makedirs(os.path.dirname(self._nonce_file), exist_ok=True)
+            with open(self._nonce_file, "w") as f:
+                f.write(str(self._nonce))
+        except Exception:
+            pass
 
     async def _next_nonce(self) -> int:
         async with self._nonce_lock:
@@ -382,6 +399,7 @@ class DangoClient:
                         self._user_index = idx
                         self._user_index_found = True
                         logger.info("Dango user_index 확정: %d", idx)
+                    self._save_nonce()
                     return result
 
                 if ("nonce is too far ahead" in err
@@ -390,9 +408,8 @@ class DangoClient:
                     chain_nonce = self._extract_chain_nonce(err)
                     if chain_nonce is not None and nonce_try < max_nonce_retries - 1:
                         async with self._nonce_lock:
-                            # already seen이면 그 nonce 자체가 사용됨 → 다음 시도는 +1
-                            # too far ahead면 chain_nonce가 max seen → 다음은 +1
                             self._nonce = chain_nonce
+                        self._save_nonce()
                         logger.warning("Dango 논스 자동 보정: %d → 다음=%d", chain_nonce, chain_nonce + 1)
                         continue
 

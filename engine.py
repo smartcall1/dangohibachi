@@ -438,17 +438,42 @@ class Engine:
             real_h = await self._hb.get_position_signed_size(Config.HIBACHI_SYMBOL_MAP[pos.pair])
             d_abs, h_abs = abs(real_d), abs(real_h)
             if abs(d_abs - h_abs) > min(d_abs, h_abs) * 0.05:
-                logger.error(
-                    "진입 후 양쪽 사이즈 불일치 (dango=%.6f hibachi=%.6f, 차이>5%%) → MANUAL",
+                logger.warning(
+                    "진입 후 양쪽 사이즈 불일치 (dango=%.6f hibachi=%.6f, 차이>5%%) → 초과분 자동 조정",
                     d_abs, h_abs,
                 )
+                excess_exchange = "dango" if d_abs > h_abs else "hibachi"
+                excess = abs(d_abs - h_abs)
+                try:
+                    if excess_exchange == "dango":
+                        close_side = "SELL" if pos.dango_side == "BUY" else "BUY"
+                        await self._dango.place_market_order(
+                            Config.DANGO_SYMBOL_MAP[pos.pair], close_side, excess,
+                            slippage=Config.EMERGENCY_CLOSE_SLIPPAGE_PCT,
+                        )
+                    else:
+                        close_side = "SELL" if pos.hibachi_side == "BUY" else "BUY"
+                        await self._hb.place_market_order(
+                            Config.HIBACHI_SYMBOL_MAP[pos.pair], close_side, excess,
+                        )
+                    await asyncio.sleep(2)
+                    adj_d = abs(await self._dango.get_position_signed_size(Config.DANGO_SYMBOL_MAP[pos.pair]))
+                    adj_h = abs(await self._hb.get_position_signed_size(Config.HIBACHI_SYMBOL_MAP[pos.pair]))
+                    pos.dango_size = adj_d
+                    pos.hibachi_size = adj_h
+                    logger.info("사이즈 자동 조정 완료: %s 초과 %.6f 청산 → dango=%.6f hibachi=%.6f", excess_exchange, excess, adj_d, adj_h)
+                    await self._tg.send_alert(
+                        f"[⚠️ ENTER 조정] {pos.pair} {excess_exchange} 초과 {excess:.6f} 자동 청산"
+                    )
+                except Exception as adj_err:
+                    logger.error("사이즈 자동 조정 실패 → MANUAL: %s", adj_err)
+                    pos.dango_size = d_abs
+                    pos.hibachi_size = h_abs
+                    self._transition(State.MANUAL_INTERVENTION)
+                    return
+            else:
                 pos.dango_size = d_abs
                 pos.hibachi_size = h_abs
-                self._transition(State.MANUAL_INTERVENTION)
-                return
-            # 일치 (±5%) — 실측으로 보정
-            pos.dango_size = d_abs
-            pos.hibachi_size = h_abs
         except Exception as e:
             logger.warning("진입 후 실측 동기화 실패 (내부 상태 유지): %s", e)
 
@@ -542,17 +567,27 @@ class Engine:
         except Exception as e:
             logger.warning("EXIT 시작 cancel_all 실패: %s", e)
 
-        total_to_exit = pos.dango_size
+        dango_sym = Config.DANGO_SYMBOL_MAP[pos.pair]
+        try:
+            actual_pos = await self._dango.get_position_signed_size(dango_sym)
+            total_to_exit = abs(actual_pos)
+            if abs(total_to_exit - pos.dango_size) > pos.dango_size * 0.01:
+                logger.warning("EXIT 초기 실측 보정: bot=%.6f → actual=%.6f", pos.dango_size, total_to_exit)
+        except Exception:
+            total_to_exit = pos.dango_size
         per_chunk = total_to_exit / Config.EXIT_CHUNKS if total_to_exit > 0 else 0
         exited = 0.0
 
         for chunk_idx in range(1, Config.EXIT_CHUNKS + 1):
-            # 매 청크마다 dust 체크 — 외부 정리/누적 청산 완료 인식
             if await self._positions_at_dust(pos):
                 logger.info("EXIT 중 dust 도달 — 청크 %d에서 조기 종료", chunk_idx)
                 break
 
-            remaining = total_to_exit - exited
+            try:
+                actual_remain = abs(await self._dango.get_position_signed_size(dango_sym))
+            except Exception:
+                actual_remain = total_to_exit - exited
+            remaining = min(total_to_exit - exited, actual_remain)
             if remaining < 1e-8:
                 break
 
