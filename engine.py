@@ -471,6 +471,9 @@ class Engine:
         # 외부 정리/수동 청산 인식 — 양쪽 실측 합이 dust 미만이면 사이클 정리
         if await self._positions_at_dust(pos):
             logger.info("HOLD 중 양쪽 dust 이하 감지 — 외부 정리로 간주, 사이클 종료")
+            await self._tg.send_alert(
+                f"[🔔 EXIT 결정] {pos.pair} | external_clear | 양쪽 dust 이하 감지"
+            )
             await self._finalize_cycle(pos, reason_override="external_clear")
             return
 
@@ -497,6 +500,9 @@ class Engine:
             logger.info("청산 조건 충족: %s", reason)
             self.bot_state.position.exit_reason = reason
             self._transition(State.EXIT)
+            await self._tg.send_alert(
+                f"[🔔 EXIT 결정] {pos.pair} | {reason} | spread_mtm: ${spread_mtm:+.2f}"
+            )
 
     # ──────────────────────────────────────────────
     # HOLD_SUSPENDED (Dango 장애)
