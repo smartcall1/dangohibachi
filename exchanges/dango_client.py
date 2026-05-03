@@ -384,17 +384,20 @@ class DangoClient:
     async def _broadcast(self, msg: dict) -> dict:
         """트랜잭션 전송. user_index 불일치 + nonce 불일치 자동 보정."""
         max_scan = 5   # user_index 스캔 범위
-        # Dango chain은 최근 20개 nonce를 기억. 봇 재시작 시 그 범위만큼 catch-up 필요.
         max_nonce_retries = 25
 
         for attempt in range(max_scan if not self._user_index_found else 1):
             idx = self._user_index + (attempt if not self._user_index_found else 0)
+            nonce_corrections = 0
+            nonce_start = self._nonce
 
             for nonce_try in range(max_nonce_retries):
                 result = await self._broadcast_once(msg, idx)
                 err = self._parse_broadcast_error(result)
 
                 if err is None:
+                    if nonce_corrections > 0:
+                        logger.info("Dango 논스 catch-up 완료: %d → %d (%d회)", nonce_start, self._nonce, nonce_corrections)
                     if not self._user_index_found:
                         self._user_index = idx
                         self._user_index_found = True
@@ -410,10 +413,13 @@ class DangoClient:
                         async with self._nonce_lock:
                             self._nonce = chain_nonce
                         self._save_nonce()
-                        logger.warning("Dango 논스 자동 보정: %d → 다음=%d", chain_nonce, chain_nonce + 1)
+                        nonce_corrections += 1
                         continue
 
                 break  # 논스 이외 에러 또는 재시도 소진
+
+            if nonce_corrections > 0:
+                logger.warning("Dango 논스 catch-up %d회 후 실패 (%d → %d)", nonce_corrections, nonce_start, self._nonce)
 
             err = self._parse_broadcast_error(result)
             if err is None:
@@ -462,7 +468,9 @@ class DangoClient:
         return result["wasm_smart"] if result else None
 
     async def _load_key_info(self) -> None:
-        """ACCOUNT_FACTORY에서 user_index, key_hash, key_type 로드."""
+        """ACCOUNT_FACTORY에서 user_index, key_hash, key_type 로드.
+        계정에 복수 키가 등록되어 있을 수 있으므로, private key에서 유도한 해시로
+        정확히 매칭되는 키를 선택한다."""
         env_val = os.environ.get("DANGO_USER_INDEX", "")
         if not (env_val and env_val.isdigit() and int(env_val) > 0):
             logger.warning("DANGO_USER_INDEX 미설정 — .env에 설정 필요")
@@ -471,6 +479,8 @@ class DangoClient:
         user_idx = int(env_val)
         self._user_index = user_idx
         logger.info("Dango user_index: %d", user_idx)
+
+        expected_hash = _derive_key_hash_ethereum(self._pk)
 
         try:
             result = await self._query_app(
@@ -481,18 +491,41 @@ class DangoClient:
             if not keys:
                 raise ValueError("factory 응답에 keys 없음")
 
+            logger.info("Factory 키 목록: %s", {h[:16] + "...": list(v.keys()) for h, v in keys.items()})
+
+            # 1순위: private key 해시로 직접 매칭
+            if expected_hash in keys:
+                key_info = keys[expected_hash]
+                self._key_hash = expected_hash
+                self._key_type = next(iter(key_info.keys()))
+                self._user_index_found = True
+                logger.info("Dango 키 로드 (해시 매칭): hash=%s type=%s", expected_hash[:16] + "...", self._key_type)
+                return
+
+            # 2순위: ethereum 타입 키 검색
+            for kh, ki in keys.items():
+                kt = next(iter(ki.keys()))
+                if kt == "ethereum":
+                    self._key_hash = kh
+                    self._key_type = kt
+                    self._user_index_found = True
+                    logger.info("Dango 키 로드 (타입 매칭): hash=%s type=%s", kh[:16] + "...", kt)
+                    return
+
+            # 3순위: 첫 번째 키 (secp256r1 등 미지원 타입만 남은 경우)
             key_hash = next(iter(keys.keys()))
             key_info = next(iter(keys.values()))
-            key_type = next(iter(key_info.keys()))  # "ethereum" | "secp256k1"
-
+            key_type = next(iter(key_info.keys()))
+            logger.warning(
+                "Factory에 ethereum 키 없음 — 첫 번째 키 사용: hash=%s type=%s (인증 실패 가능)",
+                key_hash[:16] + "...", key_type,
+            )
             self._key_hash = key_hash
             self._key_type = key_type
             self._user_index_found = True
-            logger.info("Dango 키 로드: hash=%s type=%s", key_hash[:16] + "...", key_type)
         except Exception as e:
             logger.warning("factory 키 조회 실패 (%s) — 로컬 계산으로 폴백", e)
-            # 로컬 폴백: private key에서 직접 계산
-            self._key_hash = _derive_key_hash_ethereum(self._pk)
+            self._key_hash = expected_hash
             self._key_type = "ethereum"
             self._user_index_found = True
             logger.info("Dango 키 로컬 계산: hash=%s type=%s",
