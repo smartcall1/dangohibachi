@@ -36,7 +36,6 @@ class MarginMonitor:
             await asyncio.sleep(10)
 
     async def _check(self):
-        # API 실패와 '진짜 무포지션'을 분리 — 거짓 안전 신호 방지 (delta_donemoji cycle 11/12 패턴)
         try:
             balance = await self._hb.get_balance()
             positions = await self._hb.get_positions()
@@ -54,15 +53,19 @@ class MarginMonitor:
             self._margin_pct = 100.0
             return
 
-        # 총 유지 마진 합산 (position notional × maintenance margin rate)
-        total_maint = 0.0
+        total_notional = 0.0
         for p in positions:
-            notional = abs(float(p.get("notionalValue", p.get("size", 0)) or 0))
-            # Hibachi 유지 마진율 4.67%
-            total_maint += notional * Config.HIBACHI_TAKER_FEE * 10  # ~4.67% proxy
+            qty = abs(float(p.get("quantity", p.get("size", p.get("position_size", 0))) or 0))
+            symbol = p.get("symbol", "")
+            if qty > 0 and symbol:
+                try:
+                    mark = await self._hb.get_mark_price(symbol)
+                    total_notional += qty * mark
+                except Exception:
+                    pass
 
-        if total_maint > 0:
-            self._margin_pct = (equity / total_maint) * 100
+        if total_notional > 0:
+            self._margin_pct = (equity / total_notional) * 100
         else:
             self._margin_pct = 100.0
 
