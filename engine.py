@@ -106,19 +106,18 @@ class Engine:
         s = self.bot_state
         pos = s.position
         lines = []
+        DIV = "┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈"
+        THICK = "━━━━━━━━━━━━━━━━"
 
-        # ── 헤더 ──
         if pos and s.state == State.HOLD:
             hold_h = pos.hold_minutes / 60
-            remain_d = max(0, Config.MAX_HOLD_DAYS - pos.hold_days)
             badge = "✅" if pos.hold_minutes >= Config.MIN_HOLD_MINUTES else f"⏰{Config.MIN_HOLD_MINUTES - pos.hold_minutes:.0f}m남음"
             lines.append(f"📊 #{s.cycle_count} HOLD · {pos.pair} {pos.direction.value} · 보유 {hold_h:.1f}h {badge}")
         else:
             lines.append(f"📊 {s.state.value}")
         lines.append("🎯 XEMM")
-        lines.append("━━━━━━━━━━━━━━━━")
+        lines.append(THICK)
 
-        # ── 잔고 + PnL ──
         try:
             d_bal = await self._dango.get_balance()
             d_margin = d_bal["equity"]
@@ -126,7 +125,6 @@ class Engine:
         except Exception:
             d_margin = d_avail = 0
 
-        # Dango margin은 예치 담보금만 반환 — 미실현 PnL 별도 보정 필요
         d_unrealized = 0.0
         _mark = 0.0
         if pos and pos.pair and pos.dango_size > 0:
@@ -153,19 +151,15 @@ class Engine:
             lines.append(f"   (D ${d_equity:,.2f} / H ${h_equity:,.2f})")
             lines.append(f"   진입 ${entry_total:,.0f}")
 
-            # 익절 트리거 (Dango 실질 equity 기준)
             required = pos.entry_balance + pos.target_notional * Config.ROUND_TRIP_FEE_RATE + Config.PRINCIPAL_BUFFER_USD
             gap = required - d_equity
             if gap <= 0:
                 lines.append("   🎯 원금회수 청산 임박!")
             else:
                 lines.append(f"   🎯 원금회수까지 <b>${gap:,.2f}</b>")
-        else:
-            lines.append(f"💰 <b>${total:,.0f}</b>")
-            lines.append(f"   (D ${d_equity:,.2f} / H ${h_equity:,.2f})")
 
-        # ── 포지션 ──
-        if pos:
+            lines.append(DIV)
+
             mark = _mark
             if mark > 0 and pos.avg_entry_price > 0:
                 d_chg = (mark - pos.avg_entry_price) / pos.avg_entry_price * 100
@@ -173,16 +167,20 @@ class Engine:
                     d_chg = -d_chg
             else:
                 d_chg = 0
+            h_chg = -d_chg
+
+            d_notional = pos.dango_size * mark if mark > 0 else 0
+            h_notional = pos.hibachi_size * mark if mark > 0 else 0
 
             imbalance = abs(pos.dango_size - pos.hibachi_size) / max(pos.dango_size, 1e-9) * 100
             delta_emoji = "✅" if imbalance <= 5 else "⚠️"
-            lines.append("")
             lines.append(f"📍 헷지 {delta_emoji}")
-            lines.append(f"   D {pos.dango_side:4} {pos.dango_size:.6f}  {d_chg:+.2f}%")
-            lines.append(f"   H {pos.hibachi_side:4} {pos.hibachi_size:.6f}")
-            lines.append(f"   청크 {pos.chunks_filled}/{Config.ENTRY_CHUNKS}")
+            lines.append(f"   D {pos.dango_side:4}  ${d_notional:,.0f}  {d_chg:+.2f}%")
+            lines.append(f"   H {pos.hibachi_side:4}  ${h_notional:,.0f}  {h_chg:+.2f}%")
+            lines.append(f"🏦 마진 H{self._margin_monitor.margin_pct:.0f}%")
 
-            # ── 펀딩 ──
+            lines.append(DIV)
+
             try:
                 d_fr = await self._dango.get_funding_rate(Config.DANGO_SYMBOL_MAP[pos.pair])
                 h_fr = await self._hb.get_funding_rate(Config.HIBACHI_SYMBOL_MAP[pos.pair])
@@ -192,26 +190,28 @@ class Engine:
                     net_8h = h_fr - d_fr
                 apr = net_8h * (365 * 24 / 8) * 100
                 apr_emoji = "🚀" if apr >= 30 else "✅" if apr >= 10 else "⚠️" if apr >= 0 else "🔻"
-                lines.append("")
                 lines.append(f"📈 펀딩 APR {apr_emoji} <b>{apr:+.1f}%</b>")
                 lines.append(f"   8h D {d_fr:+.6f} / H {h_fr:+.6f}")
             except Exception:
                 pass
 
-            # ── 만기 ──
+            lines.append(DIV)
+
             remain_d = max(0, Config.MAX_HOLD_DAYS - pos.hold_days)
-            lines.append(f"⏳ 자동만기까지 {remain_d:.1f}일")
+            min_remaining = Config.MIN_HOLD_MINUTES - pos.hold_minutes
+            if min_remaining > 0:
+                lines.append(f"⏳ 최소 {min_remaining:.0f}m · 만기 {remain_d:.1f}일")
+            else:
+                lines.append(f"⏳ 만기 {remain_d:.1f}일")
 
             if pos.exit_reason:
                 lines.append(f"🔚 EXIT 사유: {pos.exit_reason}")
         else:
-            lines.append("")
-            lines.append("<i>(포지션 없음)</i>")
+            lines.append(f"💰 <b>${total:,.0f}</b>")
+            lines.append(f"   (D ${d_equity:,.2f} / H ${h_equity:,.2f})")
 
-        # ── 누적 realized ──
+        lines.append(THICK)
         agg = self._aggregate_realized()
-        lines.append("")
-        lines.append("━ 누적 (realized) ━")
         if agg["count"] > 0:
             emoji = "🟢" if agg["pnl"] >= 0 else "🔴"
             lines.append(f"{emoji} {agg['count']}건 누적 ${agg['pnl']:+,.2f}")
