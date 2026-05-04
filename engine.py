@@ -112,10 +112,21 @@ class Engine:
         # ── 잔고 + PnL ──
         try:
             d_bal = await self._dango.get_balance()
-            d_equity = d_bal["equity"]
+            d_margin = d_bal["equity"]
             d_avail = d_bal["available_margin"]
         except Exception:
-            d_equity = d_avail = 0
+            d_margin = d_avail = 0
+
+        # Dango margin은 예치 담보금만 반환 — 미실현 PnL 별도 보정 필요
+        d_unrealized = 0.0
+        _mark = 0.0
+        if pos and pos.pair and pos.dango_size > 0:
+            try:
+                _mark = await self._dango.get_mark_price(Config.DANGO_SYMBOL_MAP[pos.pair])
+                d_unrealized = _calc_spread_mtm(pos, _mark)
+            except Exception:
+                pass
+        d_equity = d_margin + d_unrealized
 
         try:
             h_bal = await self._hb.get_balance()
@@ -133,7 +144,7 @@ class Engine:
             lines.append(f"   (D ${d_equity:,.2f} / H ${h_equity:,.2f})")
             lines.append(f"   진입 ${entry_total:,.0f}")
 
-            # 익절 트리거 (Dango 잔고 기준 — should_exit 로직과 동일)
+            # 익절 트리거 (Dango 실질 equity 기준)
             required = pos.entry_balance + pos.target_notional * Config.ROUND_TRIP_FEE_RATE + Config.PRINCIPAL_BUFFER_USD
             gap = required - d_equity
             if gap <= 0:
@@ -146,13 +157,13 @@ class Engine:
 
         # ── 포지션 ──
         if pos:
-            try:
-                mark = await self._dango.get_mark_price(Config.DANGO_SYMBOL_MAP[pos.pair])
-                d_chg = (mark - pos.avg_entry_price) / pos.avg_entry_price * 100 if pos.avg_entry_price > 0 else 0
+            mark = _mark
+            if mark > 0 and pos.avg_entry_price > 0:
+                d_chg = (mark - pos.avg_entry_price) / pos.avg_entry_price * 100
                 if pos.direction == Direction.B:
                     d_chg = -d_chg
-            except Exception:
-                mark = d_chg = 0
+            else:
+                d_chg = 0
 
             imbalance = abs(pos.dango_size - pos.hibachi_size) / max(pos.dango_size, 1e-9) * 100
             delta_emoji = "✅" if imbalance <= 5 else "⚠️"
@@ -245,8 +256,16 @@ class Engine:
         # Dango
         try:
             bal = await self._dango.get_balance()
-            text += f"<b>Dango</b> equity=${bal['equity']:,.2f}\n"
+            d_margin = bal['equity']
+            d_unrealized = 0.0
             pos = self.bot_state.position
+            if pos and pos.pair and pos.dango_size > 0:
+                try:
+                    _m = await self._dango.get_mark_price(Config.DANGO_SYMBOL_MAP[pos.pair])
+                    d_unrealized = _calc_spread_mtm(pos, _m)
+                except Exception:
+                    pass
+            text += f"<b>Dango</b> equity=${d_margin + d_unrealized:,.2f} (margin=${d_margin:,.2f})\n"
             if pos and pos.pair:
                 dango_pos = await self._dango.get_position(Config.DANGO_SYMBOL_MAP[pos.pair])
                 if dango_pos:
@@ -519,9 +538,9 @@ class Engine:
 
         try:
             bal = await self._dango.get_balance()
-            current_balance = bal["equity"]
+            d_margin = bal["equity"]
         except Exception:
-            current_balance = pos.entry_balance
+            d_margin = pos.entry_balance
 
         hibachi_margin = self._margin_monitor.margin_pct
 
@@ -532,6 +551,9 @@ class Engine:
             spread_mtm = _calc_spread_mtm(pos, mark)
         except Exception:
             spread_mtm = 0.0
+
+        # Dango margin에 미실현 PnL 보정 → 청산 후 실제 잔고에 근사
+        current_balance = d_margin + spread_mtm
 
         funding = await self._fetch_funding_for_pair(pos.pair)
         reason = should_exit(pos, current_balance, hibachi_margin, spread_mtm, funding)
