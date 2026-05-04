@@ -58,8 +58,8 @@ class MarginMonitor:
             qty = abs(float(p.get("quantity", p.get("size", p.get("position_size", 0))) or 0))
             symbol = p.get("symbol", "")
             if qty <= 0 or not symbol:
-                logger.debug("MarginMonitor position skip: qty=%.8f symbol=%r keys=%s",
-                             qty, symbol, list(p.keys()))
+                logger.warning("MarginMonitor position skip: qty=%.8f symbol=%r keys=%s",
+                               qty, symbol, list(p.keys()))
                 continue
             try:
                 mark = await self._hb.get_mark_price(symbol)
