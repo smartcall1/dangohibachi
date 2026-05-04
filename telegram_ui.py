@@ -58,6 +58,21 @@ class TelegramUI:
             logger.warning("TELEGRAM_BOT_TOKEN/CHAT_ID 미설정 — 텔레그램 비활성")
             return
         await self._ensure_session()
+        # 봇 오프라인 동안 쌓인 대기 업데이트 전부 무시 (Stop 누적 방지)
+        try:
+            async with self._session.get(
+                f"{self._base}/getUpdates",
+                params={"offset": -1, "timeout": 0},
+                timeout=aiohttp.ClientTimeout(total=5),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    results = data.get("result", [])
+                    if results:
+                        self._offset = results[-1]["update_id"] + 1
+                        logger.info("텔레그램 대기 업데이트 %d건 flush", len(results))
+        except Exception as e:
+            logger.debug("텔레그램 flush 실패 (무시): %s", e)
         logger.info("텔레그램 봇 시작 (aiohttp polling + persistent keyboard)")
 
     async def stop(self):
