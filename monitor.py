@@ -50,6 +50,8 @@ class MarginMonitor:
 
         equity = float(balance.get("equity", balance.get("totalEquityValue", 0)) or 0)
         if not positions or equity <= 0:
+            logger.warning("MarginMonitor early exit: positions=%d equity=%.2f bal_keys=%s",
+                           len(positions) if positions else 0, equity, list(balance.keys()))
             self._margin_pct = 100.0
             return
 
