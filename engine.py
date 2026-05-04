@@ -48,6 +48,10 @@ class Engine:
         self._state_path = os.path.join(Config.LOG_DIR, "bot_state.json")
         self._cycles_path = os.path.join(Config.LOG_DIR, "cycles.jsonl")
 
+        # Spread 기반 EXIT 확인 창 — 순간 스파이크 방지
+        self._spread_exit_confirms = 0
+        self._pending_exit_reason: Optional[str] = None
+
     # ──────────────────────────────────────────────
     # 진입점
     # ──────────────────────────────────────────────
@@ -57,8 +61,13 @@ class Engine:
         await self._dango.start()
         asyncio.create_task(self._margin_monitor.run())
         asyncio.create_task(self._health_monitor.run())
+        await self._tg.start()
         self._register_telegram_callbacks()
         logger.info("엔진 시작")
+        await self._tg.send_alert(
+            f"<b>[🚀 START]</b> Dango×Hibachi 봇 시작\n"
+            f"상태: {self.bot_state.state.value}"
+        )
         await self._recovery_check()
 
         while not self._stop_requested:
@@ -83,15 +92,15 @@ class Engine:
     def _register_telegram_callbacks(self):
         from telegram_ui import (
             BTN_STATUS, BTN_FUNDING, BTN_HISTORY,
-            BTN_POSITIONS, BTN_RESYNC, BTN_CLOSE, BTN_STOP,
+            BTN_POSITIONS, BTN_CLOSE, BTN_STOP, BTN_KILL,
         )
         self._tg.register_callback(BTN_STATUS, self._on_status)
         self._tg.register_callback(BTN_FUNDING, self._on_funding)
         self._tg.register_callback(BTN_HISTORY, self._on_history)
         self._tg.register_callback(BTN_POSITIONS, self._on_positions)
-        self._tg.register_callback(BTN_RESYNC, self._on_resync)
         self._tg.register_callback(BTN_CLOSE, self._on_close_now)
         self._tg.register_callback(BTN_STOP, self._on_stop)
+        self._tg.register_callback(BTN_KILL, self._on_kill)
 
     async def _on_status(self):
         s = self.bot_state
@@ -212,7 +221,7 @@ class Engine:
         await self._tg.send_alert("\n".join(lines))
 
     async def _on_funding(self):
-        text = "💰 <b>펀딩레이트 (8h)</b>\n\n"
+        text = "💰 <b>Funding Rates</b>\n━━━━━━━━━━━━━━━\n"
         for pair in Config.PAIRS:
             try:
                 d_fr = await self._dango.get_funding_rate(Config.DANGO_SYMBOL_MAP[pair])
@@ -237,7 +246,7 @@ class Engine:
             await self._tg.send_alert(f"📋 사이클 로그 읽기 실패: {e}")
             return
 
-        text = "📋 <b>최근 사이클 (최대 5건)</b>\n\n"
+        text = "📋 <b>최근 사이클</b>\n━━━━━━━━━━━━━━━\n"
         for line in lines:
             try:
                 c = json.loads(line)
@@ -252,7 +261,7 @@ class Engine:
 
     async def _on_positions(self):
         """양 거래소 실시간 포지션/잔고 조회"""
-        text = "📌 <b>현재 포지션</b>\n\n"
+        text = "📌 <b>Positions</b>\n━━━━━━━━━━━━━━━\n"
         # Dango
         try:
             bal = await self._dango.get_balance()
@@ -291,33 +300,33 @@ class Engine:
         """수동 정리 후 강제 동기화 — 양쪽 실측이 dust 미만이면 즉시 사이클 종료."""
         pos = self.bot_state.position
         if not pos:
-            await self._tg.send_alert("🔄 Resync: 활성 포지션 없음")
+            await self._tg.send_alert("<b>[🔄 RESYNC]</b> 활성 포지션 없음")
             return
         try:
             d_size = await self._dango.get_position_signed_size(Config.DANGO_SYMBOL_MAP[pos.pair])
             h_size = await self._hb.get_position_signed_size(Config.HIBACHI_SYMBOL_MAP[pos.pair])
         except Exception as e:
-            await self._tg.send_alert(f"🔄 Resync 실패: {e}")
+            await self._tg.send_alert(f"<b>[🔄 RESYNC]</b> 실패: {e}")
             return
 
         if await self._positions_at_dust(pos):
             await self._tg.send_alert(
-                f"🔄 Resync: 양쪽 dust 이하 (dango={d_size:.6f} hibachi={h_size:.6f})"
+                f"<b>[🔄 RESYNC]</b> 양쪽 dust 이하 (dango={d_size:.6f} hibachi={h_size:.6f})"
                 f" — 사이클 정상 종료"
             )
             await self._finalize_cycle(pos, reason_override="manual_resync")
         else:
             await self._tg.send_alert(
-                f"🔄 Resync: 잔여 보유 — dango={d_size:.6f} hibachi={h_size:.6f}\n"
-                f"수동 정리 후 다시 누르거나 🔚 Close Now 사용하시오"
+                f"<b>[🔄 RESYNC]</b> 잔여 보유 — dango={d_size:.6f} hibachi={h_size:.6f}\n"
+                f"수동 정리 후 다시 누르거나 🔚 Close Now 사용해주세요"
             )
 
     async def _on_close_now(self):
         """현재 사이클 즉시 EXIT (HOLD 상태에서만)"""
         if self.bot_state.state != State.HOLD:
             await self._tg.send_alert(
-                f"현재 상태({self.bot_state.state.value})에서는 강제 청산 불가. "
-                f"HOLD 상태에서만 가능하옵니다."
+                f"현재 상태({self.bot_state.state.value})에서는 강제 청산 불가합니다. "
+                f"HOLD 상태에서만 가능합니다."
             )
             return
         if not self.bot_state.position:
@@ -325,10 +334,14 @@ class Engine:
             return
         self.bot_state.position.exit_reason = "manual_close_now"
         self._transition(State.EXIT)
-        await self._tg.send_alert("🔚 강제 청산 시작 — EXIT 진입")
+        await self._tg.send_alert("<b>[🔚 CLOSE NOW]</b> 강제 청산 시작")
 
     async def _on_stop(self):
-        await self._tg.send_alert("⏹ 봇 종료 요청 수신 — 정리 후 종료하옵니다")
+        await self._tg.send_alert("<b>[⏹ STOP]</b> 포지션 청산 후 봇 종료합니다")
+        self._stop_requested = True
+
+    async def _on_kill(self):
+        await self._tg.send_alert("<b>[💀 KILL]</b> 포지션 유지, 봇만 즉시 종료합니다")
         self._stop_requested = True
 
     # ──────────────────────────────────────────────
@@ -487,7 +500,7 @@ class Engine:
                     pos.hibachi_size = adj_h
                     logger.info("사이즈 자동 조정 완료: %s 초과 %.6f 청산 → dango=%.6f hibachi=%.6f", excess_exchange, excess, adj_d, adj_h)
                     await self._tg.send_alert(
-                        f"[⚠️ ENTER 조정] {pos.pair} {excess_exchange} 초과 {excess:.6f} 자동 청산"
+                        f"<b>[⚠️ ENTER 조정]</b> {pos.pair} {excess_exchange} 초과 {excess:.6f} 자동 청산"
                     )
                 except Exception as adj_err:
                     logger.error("사이즈 자동 조정 실패 → MANUAL: %s", adj_err)
@@ -531,7 +544,7 @@ class Engine:
         if await self._positions_at_dust(pos):
             logger.info("HOLD 중 양쪽 dust 이하 감지 — 외부 정리로 간주, 사이클 종료")
             await self._tg.send_alert(
-                f"[🔔 EXIT 결정] {pos.pair} | external_clear | 양쪽 dust 이하 감지"
+                f"<b>[🔔 EXIT 결정]</b> {pos.pair} | external_clear | 양쪽 dust 이하 감지"
             )
             await self._finalize_cycle(pos, reason_override="external_clear")
             return
@@ -559,12 +572,37 @@ class Engine:
         reason = should_exit(pos, current_balance, hibachi_margin, spread_mtm, funding)
 
         if reason:
+            # Spread 기반 EXIT(PRINCIPAL_RECOVERY, OPPORTUNISTIC_PROFIT)는 확인 창 적용
+            # 순간 스파이크에 의한 오판 방지 — N회 연속 조건 충족 시에만 EXIT 전환
+            spread_based = reason.startswith("PRINCIPAL_RECOVERY") or reason.startswith("OPPORTUNISTIC_PROFIT")
+            if spread_based:
+                if self._pending_exit_reason and reason.split("(")[0] == self._pending_exit_reason.split("(")[0]:
+                    self._spread_exit_confirms += 1
+                else:
+                    self._spread_exit_confirms = 1
+                    self._pending_exit_reason = reason
+                logger.info(
+                    "Spread EXIT 확인 %d/%d: %s (mtm=$%.2f)",
+                    self._spread_exit_confirms, Config.SPREAD_EXIT_CONFIRM_COUNT,
+                    reason, spread_mtm,
+                )
+                if self._spread_exit_confirms < Config.SPREAD_EXIT_CONFIRM_COUNT:
+                    return
+                self._spread_exit_confirms = 0
+                self._pending_exit_reason = None
+
             logger.info("청산 조건 충족: %s", reason)
             self.bot_state.position.exit_reason = reason
             self._transition(State.EXIT)
             await self._tg.send_alert(
-                f"[🔔 EXIT 결정] {pos.pair} | {reason} | spread_mtm: ${spread_mtm:+.2f}"
+                f"<b>[🔔 EXIT 결정]</b> {pos.pair} | {reason} | spread_mtm: ${spread_mtm:+.2f}"
             )
+        else:
+            # 조건 미충족 시 확인 카운터 리셋
+            if self._spread_exit_confirms > 0:
+                logger.info("Spread EXIT 확인 리셋 (%d→0)", self._spread_exit_confirms)
+                self._spread_exit_confirms = 0
+                self._pending_exit_reason = None
 
     # ──────────────────────────────────────────────
     # HOLD_SUSPENDED (Dango 장애)
@@ -1058,7 +1096,7 @@ class Engine:
             logger.error("EXIT Hibachi 포지션 조회 실패 (Dango %.6f 이미 청산됨): %s", actual_filled, e)
             pos.dango_size = max(0.0, pos.dango_size - actual_filled)
             await self._tg.send_alert(
-                f"[🚨 EXIT 불균형] Hibachi API 장애! Dango {actual_filled:.6f} 청산됨 — 즉시 확인!"
+                f"<b>[🚨 EXIT 불균형]</b> Hibachi API 장애! Dango {actual_filled:.6f} 청산됨 — 즉시 확인!"
             )
             return False
         hb_slippages = [0.005, 0.015]
@@ -1099,7 +1137,7 @@ class Engine:
                 chunk_idx, actual_filled, hb_closed_total,
             )
             await self._tg.send_alert(
-                f"[🚨 EXIT 불균형] 청크 {chunk_idx}: Dango {actual_filled:.6f} 청산, "
+                f"<b>[🚨 EXIT 불균형]</b> 청크 {chunk_idx}: Dango {actual_filled:.6f} 청산, "
                 f"Hibachi {hb_closed_total:.6f}만 청산 — 확인 필요!"
             )
             return False
@@ -1216,7 +1254,7 @@ class Engine:
                         d_size, h_size,
                     )
                     await self._tg.send_alert(
-                        f"🚨 [RECOVERY] {pair} 양쪽 동일 방향 — 수동 확인 필요\n"
+                        f"<b>[🚨 RECOVERY]</b> {pair} 양쪽 동일 방향 — 수동 확인 필요\n"
                         f"Dango: {d_size:.6f} / Hibachi: {h_size:.6f}"
                     )
                     continue
@@ -1252,7 +1290,7 @@ class Engine:
                     pair, abs(d_size), abs(h_size),
                 )
                 await self._tg.send_alert(
-                    f"🔁 [RECOVERY] {pair} 포지션 복구 → HOLD\n"
+                    f"<b>[🔁 RECOVERY]</b> {pair} 포지션 복구 → HOLD\n"
                     f"Dango: {abs(d_size):.6f} ({direction.value})\n"
                     f"Hibachi: {abs(h_size):.6f}\n"
                     f"Mark: ${mark:,.2f}"
@@ -1262,7 +1300,7 @@ class Engine:
             side = "Dango" if d_notional >= Config.DUST_NOTIONAL_USD else "Hibachi"
             logger.warning("Recovery: %s 편측 포지션 감지 (%s)", pair, side)
             await self._tg.send_alert(
-                f"⚠️ [RECOVERY] {pair} {side}에만 포지션 존재!\n"
+                f"<b>[⚠️ RECOVERY]</b> {pair} {side}에만 포지션 존재!\n"
                 f"Dango: {d_size:.6f} / Hibachi: {h_size:.6f}\n"
                 f"수동 확인 필요"
             )
