@@ -177,7 +177,9 @@ class Engine:
             lines.append(f"📍 헷지 {delta_emoji}")
             lines.append(f"   D {pos.dango_side:4}  ${d_notional:,.0f}  {d_chg:+.2f}%")
             lines.append(f"   H {pos.hibachi_side:4}  ${h_notional:,.0f}  {h_chg:+.2f}%")
-            lines.append(f"🏦 마진 H{self._margin_monitor.margin_pct:.0f}%")
+            d_margin = (d_equity / d_notional * 100) if d_notional > 0 else 100.0
+            h_margin = (h_equity / h_notional * 100) if h_notional > 0 else 100.0
+            lines.append(f"🏦 마진 D{d_margin:.0f}% / H{h_margin:.0f}%")
 
             lines.append(DIV)
 

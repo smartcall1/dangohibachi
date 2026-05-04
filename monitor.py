@@ -57,16 +57,21 @@ class MarginMonitor:
         for p in positions:
             qty = abs(float(p.get("quantity", p.get("size", p.get("position_size", 0))) or 0))
             symbol = p.get("symbol", "")
-            if qty > 0 and symbol:
-                try:
-                    mark = await self._hb.get_mark_price(symbol)
-                    total_notional += qty * mark
-                except Exception:
-                    pass
+            if qty <= 0 or not symbol:
+                logger.debug("MarginMonitor position skip: qty=%.8f symbol=%r keys=%s",
+                             qty, symbol, list(p.keys()))
+                continue
+            try:
+                mark = await self._hb.get_mark_price(symbol)
+                total_notional += qty * mark
+            except Exception as e:
+                logger.warning("MarginMonitor mark_price 실패: symbol=%s err=%s", symbol, e)
 
         if total_notional > 0:
             self._margin_pct = (equity / total_notional) * 100
         else:
+            logger.warning("MarginMonitor total_notional=0 (positions=%d) — 100%% fallback. "
+                           "first_pos_keys=%s", len(positions), list(positions[0].keys()) if positions else [])
             self._margin_pct = 100.0
 
         if self._margin_pct <= Config.MARGIN_WARNING_PCT:
