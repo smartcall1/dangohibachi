@@ -324,17 +324,24 @@ class Engine:
             )
 
     async def _on_close_now(self):
-        """현재 사이클 즉시 EXIT (HOLD 상태에서만)"""
-        if self.bot_state.state != State.HOLD:
+        """현재 사이클 즉시 EXIT (HOLD 또는 MANUAL_INTERVENTION)"""
+        state = self.bot_state.state
+        if state not in (State.HOLD, State.MANUAL_INTERVENTION):
             await self._tg.send_alert(
-                f"현재 상태({self.bot_state.state.value})에서는 강제 청산 불가합니다. "
-                f"HOLD 상태에서만 가능합니다."
+                f"현재 상태({state.value})에서는 강제 청산 불가합니다. "
+                f"HOLD 또는 MANUAL 상태에서만 가능합니다."
             )
             return
-        if not self.bot_state.position:
-            await self._tg.send_alert("청산할 포지션 없음")
+        pos = self.bot_state.position
+        if not pos:
+            await self._tg.send_alert("청산할 포지션 없음 — IDLE 전환")
+            self._transition(State.IDLE)
             return
-        self.bot_state.position.exit_reason = "manual_close_now"
+        if await self._positions_at_dust(pos):
+            await self._tg.send_alert("<b>[🔚 CLOSE NOW]</b> 이미 dust 이하 — 사이클 종료")
+            await self._finalize_cycle(pos, reason_override="manual_close_now")
+            return
+        pos.exit_reason = "manual_close_now"
         self._transition(State.EXIT)
         await self._tg.send_alert("<b>[🔚 CLOSE NOW]</b> 강제 청산 시작")
 
@@ -798,25 +805,33 @@ class Engine:
     # ──────────────────────────────────────────────
 
     async def _state_manual(self):
+        pos = self.bot_state.position
+        if pos and await self._positions_at_dust(pos):
+            logger.info("MANUAL: 양쪽 dust 이하 감지 → 사이클 자동 종료")
+            await self._tg.send_alert("<b>[🔔 AUTO RECOVER]</b> 포지션 dust 이하 — 사이클 자동 종료")
+            await self._finalize_cycle(pos, reason_override="manual_auto_recover")
+            return
+        if not pos:
+            logger.info("MANUAL: 포지션 객체 없음 → IDLE 전환")
+            self._transition(State.IDLE)
+            return
+
         now = time.time()
         if now - self.bot_state.last_manual_alert > 1800:
-            pos = self.bot_state.position
             d_size = h_size = 0.0
             d_notional = h_notional = 0.0
-            pair = pos.pair if pos else "?"
-            if pos:
-                try:
-                    d_size = await self._dango.get_position_signed_size(Config.DANGO_SYMBOL_MAP[pos.pair])
-                    h_size = await self._hb.get_position_signed_size(Config.HIBACHI_SYMBOL_MAP[pos.pair])
-                    mark = await self._dango.get_mark_price(Config.DANGO_SYMBOL_MAP[pos.pair])
-                    d_notional = abs(d_size) * mark
-                    h_notional = abs(h_size) * mark
-                except Exception:
-                    pass
+            try:
+                d_size = await self._dango.get_position_signed_size(Config.DANGO_SYMBOL_MAP[pos.pair])
+                h_size = await self._hb.get_position_signed_size(Config.HIBACHI_SYMBOL_MAP[pos.pair])
+                mark = await self._dango.get_mark_price(Config.DANGO_SYMBOL_MAP[pos.pair])
+                d_notional = abs(d_size) * mark
+                h_notional = abs(h_size) * mark
+            except Exception:
+                pass
             await self._tg.notify_manual_intervention(
                 failures=self.bot_state.exit_failure_count,
                 cycle=self.bot_state.cycle_count,
-                pair=pair,
+                pair=pos.pair,
                 dango_size=d_size, dango_notional=d_notional,
                 hibachi_size=h_size, hibachi_notional=h_notional,
             )
