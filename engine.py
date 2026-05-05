@@ -675,15 +675,15 @@ class Engine:
 
             chunk_size = min(per_chunk, remaining)
             exit_side = "SELL" if pos.dango_side == "BUY" else "BUY"
-            success = await self._xemm_chunk_exit(
+            filled = await self._xemm_chunk_exit(
                 pos=pos,
                 chunk_idx=chunk_idx,
                 total_chunks=Config.EXIT_CHUNKS,
                 chunk_size=chunk_size,
                 exit_side=exit_side,
             )
-            if success:
-                exited += chunk_size
+            if filled > 0:
+                exited += filled
                 self.bot_state.exit_failure_count = 0
             else:
                 self.bot_state.exit_failure_count += 1
@@ -1002,9 +1002,9 @@ class Engine:
     async def _xemm_chunk_exit(
         self, pos: Position, chunk_idx: int, total_chunks: int,
         chunk_size: float, exit_side: str,
-    ) -> bool:
+    ) -> float:
         """1청크 청산: Dango maker 5회 시도 → 전부 미체결 시 시장가 fallback.
-        양쪽 체결 후 Hibachi taker로 반대 청산."""
+        양쪽 체결 후 Hibachi taker로 반대 청산. 실제 Dango 체결량 반환 (0.0=실패)."""
         dango_sym = Config.DANGO_SYMBOL_MAP[pos.pair]
         hibachi_sym = Config.HIBACHI_SYMBOL_MAP[pos.pair]
         hibachi_close_side = "BUY" if pos.hibachi_side == "SELL" else "SELL"
@@ -1022,7 +1022,7 @@ class Engine:
         for retry in range(Config.MAKER_RETRY_LIMIT):
             if self._health_monitor.is_down:
                 logger.warning("Dango 다운 — EXIT 청크 %d 중단", chunk_idx)
-                return False
+                return 0.0
 
             try:
                 bbo = await self._dango.get_bbo(dango_sym)
@@ -1063,7 +1063,7 @@ class Engine:
                 logger.warning("EXIT cancel_all 실패: %s", e)
             if not cancel_ok:
                 logger.error("EXIT cancel_all 실패 — 잔여 주문 위험, 청크 중단")
-                return False
+                return 0.0
             await asyncio.sleep(2)
 
             try:
@@ -1091,7 +1091,7 @@ class Engine:
                 )
             except Exception as e:
                 logger.error("EXIT Dango 시장가도 실패 (청크 %d): %s", chunk_idx, e)
-                return False
+                return 0.0
 
             await asyncio.sleep(3)
 
@@ -1103,7 +1103,7 @@ class Engine:
             actual_filled = max(0.0, (size_before - size_after) * (-d_exit_sign))
             if actual_filled < chunk_size * 0.01:
                 logger.error("EXIT 청크 %d 시장가도 미체결", chunk_idx)
-                return False
+                return 0.0
 
             try:
                 fill_price = await self._dango.get_mark_price(dango_sym)
@@ -1120,7 +1120,7 @@ class Engine:
             await self._tg.send_alert(
                 f"<b>[🚨 EXIT 불균형]</b> Hibachi API 장애! Dango {actual_filled:.6f} 청산됨 — 즉시 확인!"
             )
-            return False
+            return 0.0
         hb_slippages = [0.005, 0.015]
         for hb_attempt, slip_pct in enumerate(hb_slippages, 1):
             hb_remaining = actual_filled - hb_closed_total
@@ -1162,13 +1162,13 @@ class Engine:
                 f"<b>[🚨 EXIT 불균형]</b> 청크 {chunk_idx}: Dango {actual_filled:.6f} 청산, "
                 f"Hibachi {hb_closed_total:.6f}만 청산 — 확인 필요!"
             )
-            return False
+            return 0.0
 
         logger.info(
             "EXIT 청크 %d/%d: dango=%.6f hibachi=%.6f @ %.2f",
             chunk_idx, total_chunks, actual_filled, hb_closed_total, fill_price,
         )
-        return True
+        return actual_filled
 
     async def _retry_hibachi_match(self, pos: Position, deficit: float) -> bool:
         """Hibachi 청산 부족분 재매칭. Dango는 이미 청산됨, Hibachi만 추가 청산."""
