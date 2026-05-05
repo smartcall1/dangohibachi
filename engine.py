@@ -574,11 +574,16 @@ class Engine:
         except Exception:
             spread_mtm = 0.0
 
-        # Dango margin에 미실현 PnL 보정 → 청산 후 실제 잔고에 근사
-        current_balance = d_margin + spread_mtm
+        try:
+            h_bal = await self._hb.get_balance()
+            h_equity = float(h_bal.get("balance", h_bal.get("equity", 0)) or 0)
+        except Exception:
+            h_equity = 0.0
+        d_equity = d_margin + spread_mtm
+        current_total = d_equity + h_equity
 
         funding = await self._fetch_funding_for_pair(pos.pair)
-        reason = should_exit(pos, current_balance, hibachi_margin, spread_mtm, funding)
+        reason = should_exit(pos, current_total, hibachi_margin, spread_mtm, funding)
 
         if reason:
             # Spread 기반 EXIT(PRINCIPAL_RECOVERY, OPPORTUNISTIC_PROFIT)는 확인 창 적용

@@ -84,8 +84,9 @@ def should_exit(
 
     min_hold_elapsed = position.hold_minutes >= cfg.MIN_HOLD_MINUTES
 
-    # 2순위: 원금 회수
-    required = position.entry_balance + _round_trip_fee(position) + cfg.PRINCIPAL_BUFFER_USD
+    # 2순위: 원금 회수 (양쪽 합산 잔고 기준 — 편측 spread_mtm 스파이크 방지)
+    entry_total = position.entry_total_balance if position.entry_total_balance > 0 else position.entry_balance
+    required = entry_total + _round_trip_fee(position) + cfg.PRINCIPAL_BUFFER_USD
     if current_balance >= required:
         return f"PRINCIPAL_RECOVERY (잔고 {current_balance:.2f} ≥ {required:.2f})"
 

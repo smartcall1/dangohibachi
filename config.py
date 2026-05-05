@@ -70,7 +70,7 @@ class Config:
     MARGIN_EMERGENCY_PCT: float = float(os.getenv("MARGIN_EMERGENCY_PCT", "10"))
     MARGIN_WARNING_PCT: float = float(os.getenv("MARGIN_WARNING_PCT", "12"))
     SPREAD_OPPORTUNISTIC_USD: float = float(os.getenv("SPREAD_OPPORTUNISTIC_USD", "30"))
-    PRINCIPAL_BUFFER_USD: float = float(os.getenv("PRINCIPAL_BUFFER_USD", "25"))
+    PRINCIPAL_BUFFER_USD: float = float(os.getenv("PRINCIPAL_BUFFER_USD", "45"))
     # Spread 기반 EXIT 확인 창 — 순간 스파이크 방지 (30s × N = 확인 시간)
     SPREAD_EXIT_CONFIRM_COUNT: int = int(os.getenv("SPREAD_EXIT_CONFIRM_COUNT", "3"))
 
