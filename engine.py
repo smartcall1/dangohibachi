@@ -151,8 +151,8 @@ class Engine:
             lines.append(f"   (D ${d_equity:,.2f} / H ${h_equity:,.2f})")
             lines.append(f"   진입 ${entry_total:,.0f}")
 
-            required = pos.entry_balance + pos.target_notional * Config.ROUND_TRIP_FEE_RATE + Config.PRINCIPAL_BUFFER_USD
-            gap = required - d_equity
+            required = entry_total + pos.target_notional * Config.ROUND_TRIP_FEE_RATE + Config.PRINCIPAL_BUFFER_USD
+            gap = required - total
             if gap <= 0:
                 lines.append("   🎯 원금회수 청산 임박!")
             else:
