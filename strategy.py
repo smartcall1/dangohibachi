@@ -90,9 +90,10 @@ def should_exit(
     if current_balance >= required:
         return f"PRINCIPAL_RECOVERY (잔고 {current_balance:.2f} ≥ {required:.2f})"
 
-    # 3순위: 기회적 익절
-    if min_hold_elapsed and spread_mtm_usd >= cfg.SPREAD_OPPORTUNISTIC_USD:
-        return f"OPPORTUNISTIC_PROFIT (MTM +{spread_mtm_usd:.2f})"
+    # 3순위: 기회적 익절 (양쪽 합산 실질 PnL 기준 — 편측 spread_mtm 스파이크 방지)
+    total_pnl = current_balance - entry_total
+    if min_hold_elapsed and total_pnl >= cfg.SPREAD_OPPORTUNISTIC_USD:
+        return f"OPPORTUNISTIC_PROFIT (PnL +{total_pnl:.2f})"
 
     # 4순위: 최대 보유 기간
     if position.hold_days >= cfg.MAX_HOLD_DAYS:
