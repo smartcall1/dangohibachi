@@ -122,7 +122,7 @@ def _funding_reversed(direction: Direction, rates: dict[str, float]) -> bool:
     else:
         net = hibachi_fr - dango_fr
     # 손실이 커지고 있으면 탈출
-    return net < -0.0003   # 8h 기준 -0.03% 이상 손해 시
+    return net < -0.00015   # 8h 기준 -0.015% 이상 손해 시 (≈-16.4% APR)
 
 
 def calc_chunk_size(total_notional: float, price: float, num_chunks: int) -> float:
