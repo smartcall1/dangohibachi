@@ -63,7 +63,7 @@ class Config:
 
     # 보유 시간
     MIN_HOLD_MINUTES: int = int(os.getenv("MIN_HOLD_MINUTES", "30"))
-    MAX_HOLD_DAYS: int = int(os.getenv("MAX_HOLD_DAYS", "4"))
+    MAX_HOLD_DAYS: int = int(os.getenv("MAX_HOLD_DAYS", "2"))
     COOLDOWN_MINUTES: int = int(os.getenv("COOLDOWN_MINUTES", "5"))
 
     # 청산 임계값

@@ -467,16 +467,36 @@ class DangoClient:
         result = data["data"]["queryApp"]
         return result["wasm_smart"] if result else None
 
+    async def _resolve_user_index(self) -> int:
+        """DANGO_USER_INDEX .env 값 → 그대로 사용, 미설정 시 address로 자동 조회."""
+        env_val = os.environ.get("DANGO_USER_INDEX", "")
+        if env_val and env_val.isdigit() and int(env_val) > 0:
+            return int(env_val)
+
+        logger.info("DANGO_USER_INDEX 미설정 — account address로 자동 조회 시도")
+        result = await self._query_app(
+            {"account": {"address": self._addr}},
+            contract=self._ACCOUNT_FACTORY,
+        )
+        if not result or "owner" not in result:
+            raise RuntimeError(
+                f"ACCOUNT_FACTORY에서 address={self._addr}의 user_index를 찾을 수 없습니다. "
+                f".env에 DANGO_USER_INDEX=<값>을 직접 설정하세요."
+            )
+        idx = int(result["owner"])
+        logger.info("Dango user_index 자동 발견: %d (address=%s)", idx, self._addr)
+        return idx
+
     async def _load_key_info(self) -> None:
         """ACCOUNT_FACTORY에서 user_index, key_hash, key_type 로드.
         계정에 복수 키가 등록되어 있을 수 있으므로, private key에서 유도한 해시로
         정확히 매칭되는 키를 선택한다."""
-        env_val = os.environ.get("DANGO_USER_INDEX", "")
-        if not (env_val and env_val.isdigit() and int(env_val) > 0):
-            logger.warning("DANGO_USER_INDEX 미설정 — .env에 설정 필요")
+        try:
+            user_idx = await self._resolve_user_index()
+        except Exception as e:
+            logger.warning("user_index 확인 실패: %s", e)
             return
 
-        user_idx = int(env_val)
         self._user_index = user_idx
         logger.info("Dango user_index: %d", user_idx)
 
