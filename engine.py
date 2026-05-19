@@ -704,12 +704,38 @@ class Engine:
                     self._transition(State.MANUAL_INTERVENTION)
                     return
 
-        # 청산 후 실측 확정 — 잔여가 dust 초과면 MANUAL
+        # 청산 후 잔여분 보완 — 부분 체결 적자를 추가 청크로 회수
+        cleanup_attempt = 0
+        while not await self._positions_at_dust(pos) and cleanup_attempt < Config.MAX_EXIT_FAILURES:
+            cleanup_attempt += 1
+            try:
+                actual_remain = abs(await self._dango.get_position_signed_size(dango_sym))
+            except Exception:
+                actual_remain = 0
+            if actual_remain < 1e-8:
+                break
+            logger.info(
+                "EXIT 잔여분 보완 청크 %d/%d: %.6f BTC",
+                cleanup_attempt, Config.MAX_EXIT_FAILURES, actual_remain,
+            )
+            exit_side = "SELL" if pos.dango_side == "BUY" else "BUY"
+            filled = await self._xemm_chunk_exit(
+                pos=pos,
+                chunk_idx=Config.EXIT_CHUNKS + cleanup_attempt,
+                total_chunks=Config.EXIT_CHUNKS + cleanup_attempt,
+                chunk_size=actual_remain,
+                exit_side=exit_side,
+            )
+            if filled > 0:
+                exited += filled
+            else:
+                logger.warning("EXIT 잔여분 보완 청크 %d 실패", cleanup_attempt)
+
         if not await self._positions_at_dust(pos):
             d_remain = await self._dango.get_position_signed_size(Config.DANGO_SYMBOL_MAP[pos.pair])
             h_remain = await self._hb.get_position_signed_size(Config.HIBACHI_SYMBOL_MAP[pos.pair])
             logger.warning(
-                "EXIT 5청크 완료 후 잔여 dust 초과 — dango=%.6f hibachi=%.6f → MANUAL",
+                "EXIT 보완 청크 포함 완료 후에도 잔여 dust 초과 — dango=%.6f hibachi=%.6f → MANUAL",
                 d_remain, h_remain,
             )
             self._transition(State.MANUAL_INTERVENTION)
