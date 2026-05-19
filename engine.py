@@ -657,10 +657,25 @@ class Engine:
                 logger.warning("EXIT 초기 실측 보정: bot=%.6f → actual=%.6f", pos.dango_size, total_to_exit)
         except Exception:
             total_to_exit = pos.dango_size
-        per_chunk = total_to_exit / Config.EXIT_CHUNKS if total_to_exit > 0 else 0
+        try:
+            mark = (await self._dango.get_bbo(dango_sym))["mark"]
+        except Exception:
+            mark = pos.avg_entry_price or 1
+        total_notional = total_to_exit * mark
+        min_chunk_notional = Config.DUST_NOTIONAL_USD * 10  # $100 — 이 미만으로 쪼개지 않음
+        effective_chunks = min(
+            Config.EXIT_CHUNKS,
+            max(1, int(total_notional / min_chunk_notional)),
+        )
+        if effective_chunks < Config.EXIT_CHUNKS:
+            logger.info(
+                "EXIT 청크 축소: %d → %d (notional=$%.2f, 청크당≥$%.0f)",
+                Config.EXIT_CHUNKS, effective_chunks, total_notional, min_chunk_notional,
+            )
+        per_chunk = total_to_exit / effective_chunks if total_to_exit > 0 else 0
         exited = 0.0
 
-        for chunk_idx in range(1, Config.EXIT_CHUNKS + 1):
+        for chunk_idx in range(1, effective_chunks + 1):
             if await self._positions_at_dust(pos):
                 logger.info("EXIT 중 dust 도달 — 청크 %d에서 조기 종료", chunk_idx)
                 break
